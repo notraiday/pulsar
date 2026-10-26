@@ -244,6 +244,12 @@ pub fn after_wake(phase: Phase, now: i64, listen_started_ms: i64) -> bool {
         && now - listen_started_ms < COMMAND_AFTER_WAKE_MS
 }
 
+/// Whether the microphone keeps streaming once the wake word arbitration is over: into the HA
+/// pipeline (LISTENING) or into a Live dialog (`phase` stays Idle meanwhile).
+pub fn stream_after_arbitration(phase: Phase, live_streaming: bool) -> bool {
+    phase == Phase::Listening || live_streaming
+}
+
 /// Music of this station: playing or loading on the HA media channel or as a Sendspin stream, or
 /// paused / ended less than PAUSED_MUSIC_MS ago (Sendspin: its server still connected).
 /// `*_since`: when the media channel paused / the Sendspin stream ended; None = not since start.

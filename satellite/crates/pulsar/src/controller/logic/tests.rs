@@ -585,3 +585,12 @@ fn microphones_mutes() {
     // The button never sets the software mute.
     assert!(!sw_mute_after_button(false, true));
 }
+
+#[test]
+fn the_microphone_streams_into_whatever_dialog_the_wake_word_started() {
+    // A Live dialog keeps the phase Idle: its stream must survive the end of the arbitration.
+    assert!(stream_after_arbitration(Phase::Idle, true));
+    assert!(stream_after_arbitration(Phase::Listening, false));
+    assert!(!stream_after_arbitration(Phase::Idle, false));
+    assert!(!stream_after_arbitration(Phase::Speaking, false));
+}

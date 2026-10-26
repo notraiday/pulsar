@@ -201,7 +201,7 @@ impl Controller {
         // chunk between the preroll and live audio.
         let phrase = self.arb_phrase.clone();
         self.answer_wake(&phrase, audio);
-        if self.phase != Phase::Listening {
+        if !logic::stream_after_arbitration(self.phase, self.live_streaming()) {
             self.mic.set_streaming(false); // no dialog started (e.g. HA gone)
         }
     }
@@ -215,7 +215,7 @@ impl Controller {
         self.arb_claim = None;
         self.arb_audio.clear();
         self.arb_command.clear();
-        if self.phase != Phase::Listening && !self.live_streaming() {
+        if !logic::stream_after_arbitration(self.phase, self.live_streaming()) {
             self.mic.set_streaming(false);
         }
     }
