@@ -74,7 +74,14 @@ def test_two_stations_say_it_together_and_the_louder_one_answers(tmp_path, monke
         (ra, wa), (rb, wb) = await asyncio.gather(
             station(port, {"station": "midi", "protocol": 1, "reminder": text}),
             station(port, {"station": "mini", "protocol": 1, "reminder": text}))
-        got_a, got_b = await asyncio.gather(frames_until(ra, {b"A"}), frames_until(rb, {b"A"}))
+        n = len(reminders.chime() + SPEECH)
+
+        async def all_audio(r):
+            out = []
+            while sum(len(p) for t, p in out if t == b"A") < n:
+                out += await frames_until(r, {b"A"})
+            return out
+        got_a, got_b = await asyncio.gather(all_audio(ra), all_audio(rb))
         # Each mic hears the other station saying it: that is no barge-in and no question.
         await asyncio.gather(talk(wa, [LOUDER] * 20), talk(wb, [LOUDER] * 20))
         for w in (wa, wb):
@@ -91,9 +98,11 @@ def test_two_stations_say_it_together_and_the_louder_one_answers(tmp_path, monke
         return got_a, got_b, end_b, rest_a
 
     got_a, got_b, end_b, rest_a = asyncio.run(with_bridge(tmp_path, monkeypatch, seen, scenario))
-    # one synthesis (tags stripped), the same audio on both
+    # one synthesis (tags stripped), the same audio on both: the bell, then the words right after it
     assert seen["tts"][0] == "Пора выключить чайник!"
     assert [p for t, p in got_a if t == b"A"] == [p for t, p in got_b if t == b"A"] != []
+    heard = b"".join(p for t, p in got_a if t == b"A")
+    assert heard == reminders.chime() + SPEECH
     # the quieter station leaves, the louder one answers in the reminder's context
     assert end_b[-1] == (b"X", b"another station answers")
     assert len(seen["chat"]) == 1

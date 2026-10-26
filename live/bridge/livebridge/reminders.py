@@ -2,17 +2,22 @@
 with a bridge turns into a Live dialog whose hello carries the text) is spoken on every station that got it, and the
 one that hears the owner loudest keeps the dialog.
 
-Stations that open a dialog with the same reminder text within JOIN_S form a group. The group synthesises the text
-once and streams the same audio to all of them (one joining late gets it from where the others are, so they stay in
-step). While more than one station is speaking it, nobody listens: each mic hears the other stations' voice, which
+Stations that open a dialog with the same reminder text within JOIN_S form a group. The group synthesises the whole
+text once, then sends a bell followed at once by the words (no wait for the TTS after the bell) to all of them (one
+joining late gets it from where the others are, so they stay in step). LIVE_REMINDER_SOUND: a wav file for the bell,
+"off" for none; by default a short synthesised chime. While more than one station is speaking it, nobody listens: each mic hears the other stations' voice, which
 its echo canceller cannot remove. Then every station listens; the first utterance opens a DECIDE_S window, the station
 whose mic heard it loudest (mean dBFS of its voiced frames until the decision) answers, the others end their
 dialog.
 """
 import asyncio
+import audioop
 import logging
+import math
 import os
+import struct
 import time
+import wave
 
 from .wire import frame
 
@@ -24,7 +29,50 @@ DECIDE_S = float(os.environ.get("LIVE_REMINDER_DECIDE_S", "0.35"))  # who heard 
 GUARD_S = 0.3                                                       # after the last station went quiet
 PCM_RATE = 48000                                                    # bytes per second of 24 kHz s16 mono
 
+SOUND = os.environ.get("LIVE_REMINDER_SOUND", "")
+
 _groups: dict[str, "Group"] = {}
+
+
+def chime() -> bytes:
+    """Two soft bell notes (E6, C6) with a few partials and a fast decay, 24 kHz s16 mono, ~0.9 s."""
+    rate, out = 24000, []
+    for start, f0 in ((0.0, 1318.5), (0.28, 1046.5)):
+        n0 = int(start * rate)
+        for i in range(int(0.62 * rate)):
+            t = i / rate
+            env = math.exp(-t * 6.0) * min(1.0, t * 400)
+            v = sum(a * math.sin(2 * math.pi * f0 * k * t) for k, a in ((1, 1.0), (2.76, 0.35), (5.4, 0.12)))
+            j = n0 + i
+            while len(out) <= j:
+                out.append(0.0)
+            out[j] += 0.22 * env * v
+    out += [0.0] * int(0.12 * rate)  # a breath before the words
+    return b"".join(struct.pack("<h", max(-32767, min(32767, int(x * 32767)))) for x in out)
+
+
+def load_sound(path: str) -> bytes:
+    """A wav file as 24 kHz s16 mono."""
+    with wave.open(path, "rb") as w:
+        ch, width, rate, pcm = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.readframes(w.getnframes())
+    if width != 2:
+        pcm, width = audioop.lin2lin(pcm, width, 2), 2
+    if ch == 2:
+        pcm = audioop.tomono(pcm, 2, 0.5, 0.5)
+    if rate != 24000:
+        pcm, _ = audioop.ratecv(pcm, 2, 1, rate, 24000, None)
+    return pcm
+
+
+def bell() -> bytes:
+    if SOUND == "off":
+        return b""
+    if SOUND:
+        try:
+            return load_sound(SOUND)
+        except (OSError, wave.Error, EOFError) as e:
+            log.warning("reminder sound %s not usable (%r), using the built-in chime", SOUND, e)
+    return chime()
 
 
 def _key(text: str) -> str:
@@ -77,19 +125,26 @@ class Group:
             s.send(frame(b"A", pcm[i:i + 4800]))
 
     async def speak(self, chunks):
-        """`chunks`: async iterator of 24 kHz PCM for the text (the TTS of the member that opened the group)."""
+        """`chunks`: async iterator of 24 kHz PCM for the text (the TTS of the member that opened the group). The
+        whole text is synthesised first (while the other stations join), then bell and words go out back to back."""
         try:
-            await asyncio.sleep(GATHER_S)
-            log.info("reminder to %d station(s): %r", len(self.members), self.text[:120])
+            t0 = time.monotonic()
+            words = bytearray()
             async for pcm in chunks:
-                if self.t_first is None:
-                    self.t_first = time.monotonic()
-                self.pcm += pcm
-                for s in list(self.members):
-                    self._send(s, pcm)
-                    await s.st.drain()
-            if not self.pcm:
+                words += pcm
+            if not words:
                 log.warning("reminder: nothing to say (TTS gave no audio)")
+                return
+            wait = GATHER_S - (time.monotonic() - t0)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            log.info("reminder to %d station(s) after %.2fs of synthesis: %r", len(self.members),
+                     time.monotonic() - t0, self.text[:120])
+            self.pcm = bytearray(bell()) + words
+            self.t_first = time.monotonic()
+            for s in list(self.members):
+                self._send(s, bytes(self.pcm))
+                await s.st.drain()
         except asyncio.CancelledError:
             raise
         except Exception as e:
