@@ -15,6 +15,7 @@ from pathlib import Path
 
 from pysilero_vad import SileroVoiceActivityDetector
 
+from . import stt
 from .util import wav16k
 from .wire import Station, frame
 
@@ -62,6 +63,8 @@ class Session:
         self.quiet = [0, 0.0]           # frames, sum dBFS: mic while nothing plays and nobody talks
         self.group = None               # reminders.Group of a dialog the house started (reminder on several stations)
         self.vad_off = False            # another station of the group answers: hear nothing more
+        self.http = None                # backends that have one set it (stt.py uses it)
+        self.bg: set = set()            # background tasks of the dialog (cancelled when it ends)
 
     # ---- hooks for backends ----
     async def open(self):
@@ -77,8 +80,8 @@ class Session:
     async def on_mic(self, pcm: bytes):
         self.feed(pcm)
 
-    def on_utterance(self, pcm: bytes):
-        """The turn detector heard the end of an utterance."""
+    def on_utterance(self, pcm: bytes, text: str | None = None):
+        """The turn detector heard the end of an utterance (`text`: its local transcript, when one was needed)."""
 
     def working(self) -> bool:
         """Background work (tool calls) that keeps the dialog open although nothing plays."""
@@ -116,6 +119,12 @@ class Session:
     def touch(self):
         self.last_activity = time.monotonic()
 
+    def spawn(self, coro):
+        t = asyncio.create_task(coro)
+        self.bg.add(t)
+        t.add_done_callback(self.bg.discard)
+        return t
+
     async def run(self):
         await self.open()
         self.set_state("listening")
@@ -127,6 +136,8 @@ class Session:
                 log.warning("dialog task failed: %r", t.exception())
                 self.ending = self.ending or "error"
         self.cancel_response(flush=False)
+        for t in list(self.bg):
+            t.cancel()
         if self.group is not None:
             self.group.leave(self)
         await self.close()
@@ -236,12 +247,26 @@ class Session:
             self.utt, self.pre, self.flags = None, [], []
             pcm = b"".join(utt)
             if voiced_n * FRAME_MS < MIN_SPEECH_MS:
+                if stt.enabled() and self.http is not None and voiced_n * FRAME_MS >= stt.RESCUE_MIN_MS:
+                    self.spawn(self.rescue(pcm, voiced_n * FRAME_MS))  # a short command, or noise?
+                    return
                 log.info("ignored a short noise (%d ms voiced)", voiced_n * FRAME_MS)
                 self.dump("noise", pcm)
                 return
             log.info("utterance %.1fs (%d ms voiced)", len(pcm) / 32000, voiced_n * FRAME_MS)
             self.dump("utt", pcm)
             self.on_utterance(pcm)
+
+    async def rescue(self, pcm: bytes, voiced_ms: int):
+        """Too short for the VAD: the local STT decides whether it was words ("удали их") or noise."""
+        text = await stt.transcribe(self.http, pcm)
+        if stt.has_words(text) and not self.vad_off and not self.ending:
+            log.info("short utterance kept (%d ms voiced): %r", voiced_ms, text)
+            self.dump("utt", pcm)
+            self.on_utterance(pcm, text)
+        else:
+            log.info("ignored a short noise (%d ms voiced)%s", voiced_ms, f", heard {text!r}" if text else "")
+            self.dump("noise", pcm)
 
     def report_echo(self):
         """What the station's echo canceller leaves of our own voice in the mic stream (it feeds us the cleaned signal)."""

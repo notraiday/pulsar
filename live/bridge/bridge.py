@@ -8,6 +8,7 @@ livebridge/wire.py and docs/live.md.
 """
 import asyncio
 import logging
+import logging.handlers
 import os
 
 import aiohttp
@@ -22,6 +23,7 @@ log = logging.getLogger("live")
 LISTEN = os.environ.get("LIVE_LISTEN", "0.0.0.0:10700")
 ROUTES = os.environ.get("LIVE_ROUTES") or str(HERE / "routes.json")
 HELLO_TIMEOUT = 10.0
+LOG_FILE = os.environ.get("LIVE_LOG_FILE")  # also log here (rotated, 4 x 5 MiB)
 
 
 async def dialog(reader, writer, http: aiohttp.ClientSession, routes: Routes):
@@ -66,6 +68,11 @@ async def serve(listen: str, routes: Routes, http: aiohttp.ClientSession):
 
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if LOG_FILE:
+        # Survives the container: `docker rm` takes docker's own log with it.
+        h = logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=5 << 20, backupCount=3, encoding="utf-8")
+        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logging.getLogger().addHandler(h)
     http = aiohttp.ClientSession(connector=aiohttp.TCPConnector(keepalive_timeout=120))
     routes = Routes(ROUTES)
     server = await serve(LISTEN, routes, http)

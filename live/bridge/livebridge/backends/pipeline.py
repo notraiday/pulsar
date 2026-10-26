@@ -25,7 +25,7 @@ from pathlib import Path
 
 import aiohttp
 
-from .. import reminders
+from .. import reminders, stt
 from ..agent import Agent
 from ..session import Session
 from ..util import BackendUnavailable, HERE, clean_for_speech, read_instructions, wav16k
@@ -59,7 +59,10 @@ REMINDER_NOTE = (
     "\n\nЭтот разговор начала ты сама: по расписанию ты только что сказала хозяину вслух: «{text}». Он может "
     "ответить, переспросить, спросить подробности, попросить напомнить позже (тогда поставь новое напоминание "
     "через ask_hermes) или больше не напоминать об этом (тогда попроси ask_hermes удалить это напоминание, назвав "
-    "его текст). Если он просто подтвердил («ок», «спасибо», «понял») — сразу вызови end_dialog.")
+    "его текст). На «о чём это?» отвечай сама: текст напоминания ты знаешь. Если он просто подтвердил («ок», "
+    "«спасибо», «понял») — сразу вызови end_dialog.")
+# The local transcript next to the audio of a turn (stt.py).
+STT_HINT = "(Расшифровка этой реплики локальным распознавателем, может ошибаться — сверяй со звуком: «{text}».)"
 
 SENT_RE = re.compile(r"(.+?[.!?…]+[\"»)]?)(?:\s+|$)", re.S)
 
@@ -119,6 +122,7 @@ class Dialog(Session):
         self.placeheld = set() # ... that were given a "still running" placeholder; the result comes as a note
         self.notes = []        # late results waiting for the next model round
         self.carry = False     # the next answer has to cover results the owner has not heard yet
+        self.asked = {}        # call id -> the agent request, for notes about results the owner has not heard
 
     async def open(self):
         if not OR_KEY:
@@ -152,10 +156,10 @@ class Dialog(Session):
     def followup_due(self) -> bool:
         return self.has_unspoken_results()
 
-    def on_utterance(self, pcm: bytes):
+    def on_utterance(self, pcm: bytes, text: str | None = None):
         if self.group is not None and not self.group.won(self):
             return  # another station of the reminder answers
-        self.start_response(pcm)
+        self.start_response(pcm, text)
 
     # ---- reply ----
     # ---- tool calls that survive an interruption ----
@@ -201,6 +205,9 @@ class Dialog(Session):
                 self.orphans.discard(cid)
                 self.tools.pop(cid, None)
                 self.carry = True
+                req = self.asked.get(cid, "")
+                self.notes.append(f"(Ответ на прежнюю просьбу «{req}» хозяин ещё не слышал: его перебили. "
+                                  "Скажи его тоже, вместе с ответом на новую реплику.)")
             elif cid not in self.placeheld:
                 self.insert_tool(cid, "Агент ещё выполняет эту просьбу, результат придёт отдельно. Не повторяй её.")
                 self.placeheld.add(cid)
@@ -240,21 +247,35 @@ class Dialog(Session):
         self.speaking = False
         self.turn_open = False
 
-    def start_response(self, pcm: bytes):
+    def start_response(self, pcm: bytes, text: str | None = None):
+        """`text`: a transcript already made (a short utterance the STT kept); it always goes to the model."""
         self.cancel_response(flush=False)
+        self.turn_open = True
+        self.set_state("thinking")
+        self.resp = asyncio.create_task(self.respond((pcm, text)))
+
+    def add_user_turn(self, pcm: bytes, hint: str | None):
         for i in [i for i, m in enumerate(self.history) if isinstance(m.get("content"), list)][:-2]:
             self.history[i] = {"role": "user", "content": "(реплика хозяина)"}  # only the last turns keep their sound
-        self.history.append({"role": "user", "content": [{
-            "type": "input_audio",
-            "input_audio": {"data": base64.b64encode(wav16k(pcm)).decode(), "format": "wav"}}]})
+        content = [{"type": "input_audio",
+                    "input_audio": {"data": base64.b64encode(wav16k(pcm)).decode(), "format": "wav"}}]
+        if hint:
+            content.insert(0, {"type": "text", "text": STT_HINT.format(text=hint)})
+        self.history.append({"role": "user", "content": content})
         del self.history[:-14]
         while self.history and self.history[0].get("role") != "user":
             self.history.pop(0)  # never start with a tool result whose call was trimmed away
-        self.turn_open = True
-        self.set_state("thinking")
-        self.resp = asyncio.create_task(self.respond())
 
-    async def respond(self):
+    async def respond(self, utt=None):
+        """`utt`: (pcm, transcript or None) of the utterance this answers; None for a follow-up of late results."""
+        if utt is not None:
+            pcm, text = utt
+            if text is None and stt.enabled():
+                if stt.HINT:
+                    text = await stt.transcribe(self.http, pcm)  # ~0.3 s, also logged
+                else:
+                    self.spawn(stt.transcribe(self.http, pcm))   # only for the log
+            self.add_user_turn(pcm, text if (text and (stt.HINT or utt[1])) else None)
         q: asyncio.Queue = asyncio.Queue()
         self.tts_task = asyncio.create_task(self.tts_worker(q))
         try:
@@ -277,6 +298,10 @@ class Dialog(Session):
                         break
                 tasks = []
                 for c in calls:
+                    try:
+                        self.asked[c["id"]] = json.loads(c["args"] or "{}").get("request", "")
+                    except ValueError:
+                        pass
                     t = asyncio.create_task(self.run_call(c))
                     self.tools[c["id"]] = t
                     t.add_done_callback(lambda t, c=c: self.tool_done(c, t))
