@@ -18,7 +18,11 @@ The dialog ends when the station or the model closes it, or after the idle time 
 Options (routes.json): voice, model, instructions (a file); the agent's: agent, ha_agent_id, ha_device_id,
 ha_satellite_id (agent.py).
 Environment: OPENAI_API_KEY, LIVE_GPT_URL, LIVE_GPT_MODEL, LIVE_GPT_VOICE, LIVE_GPT_PROXY (else LIVE_OR_PROXY),
-LIVE_GPT_HEADERS (JSON, extra connection headers), LIVE_GPT_DROP_GAP_S.
+LIVE_GPT_HEADERS (JSON, extra connection headers), LIVE_GPT_DROP_GAP_S, LIVE_GPT_ZDR.
+
+Zero data retention (util.ZDR): the sound and the transcripts go to OpenAI itself, which keeps them unless the
+organisation of the key has ZDR with OpenAI. So with ZDR on, the backend refuses (the dialog is handed off) unless
+LIVE_GPT_ZDR=1 says the organisation has it.
 """
 import asyncio
 import audioop
@@ -33,7 +37,7 @@ import aiohttp
 
 from ..agent import Agent
 from ..session import Session
-from ..util import BackendUnavailable, HERE, read_instructions
+from ..util import ZDR, BackendUnavailable, HERE, read_instructions
 from ..wire import Station, frame
 
 log = logging.getLogger("live")
@@ -80,6 +84,9 @@ class GptLive(Session):
     async def open(self):
         if not os.environ.get("OPENAI_API_KEY"):
             raise BackendUnavailable("OPENAI_API_KEY is not set")
+        if ZDR and os.environ.get("LIVE_GPT_ZDR") != "1":
+            raise BackendUnavailable("zero data retention is required (LIVE_ZDR) and OpenAI keeps data unless the "
+                                     "organisation has ZDR: set LIVE_GPT_ZDR=1 if it has")
         if self.st.hello.get("reminder"):
             # The station announces it itself then (hand-off): this backend has no way to open with a given text.
             raise BackendUnavailable("gpt-live does not open dialogs with a reminder")

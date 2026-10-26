@@ -9,7 +9,7 @@ from aiohttp import web
 
 import bridge
 from conftest import LOUDER, QUIET, fake_ha, frames_until, serve_app, station
-from livebridge import agent, session, wire
+from livebridge import agent, session, stt, wire
 from livebridge.backends import pipeline
 from livebridge.routes import Routes
 
@@ -63,17 +63,18 @@ class W:
 
 class Http:
     def __init__(self, script):
-        self.script, self.calls = list(script), 0
+        self.script, self.calls, self.providers = list(script), 0, []
 
     def post(self, *a, **k):
         spec = self.script[min(self.calls, len(self.script) - 1)]
         self.calls += 1
+        self.providers.append((k.get("json") or {}).get("provider"))
         return CM(Resp(*spec))
 
 
-def hedge(monkeypatch, script):
+def hedge(monkeypatch, script, http=None):
     monkeypatch.setattr(pipeline, "LLM_HEDGE_S", 0.2)
-    http = Http(script)
+    http = http or Http(script)
     d = pipeline.Dialog(wire.Station(None, W(), {}), http)
 
     async def go():
@@ -101,6 +102,47 @@ def test_a_stalled_provider_loses_to_the_second_request(monkeypatch, fake_vad):
 
 def test_http_error_is_retried_once(monkeypatch, fake_vad):
     assert hedge(monkeypatch, [(500, [], 0.0), (200, EVS, 0.0)]) == (2, "Привет мир.", None)
+
+
+def test_the_retry_after_an_error_stays_on_zdr_endpoints(monkeypatch, fake_vad):
+    monkeypatch.setattr(pipeline, "ZDR", True)
+    http = Http([(500, [], 0.0), (200, EVS, 0.0)])
+    hedge(monkeypatch, None, http)
+    assert http.providers[1] == {"zdr": True, "data_collection": "deny"}
+
+
+# ---- zero data retention ----
+
+
+def test_every_model_is_routed_to_zdr_endpoints_only(monkeypatch):
+    monkeypatch.setattr(pipeline, "ZDR", True)
+    monkeypatch.delenv("LIVE_LLM_PROVIDER", raising=False)
+    g = pipeline.provider_for("google/gemini-3.6-flash")
+    assert g["zdr"] is True and g["data_collection"] == "deny" and g["allow_fallbacks"] is False
+    assert all(o.startswith("google-vertex/") for o in g["order"])  # AI Studio keeps data
+    d = pipeline.provider_for("deepseek/deepseek-v4.1-flash")
+    assert d["zdr"] is True and d["order"][0] == "together"
+    assert pipeline.provider_for("someone/model") == {"zdr": True, "data_collection": "deny"}
+    monkeypatch.setenv("LIVE_LLM_PROVIDER", '{"order": ["google-ai-studio"]}')
+    assert pipeline.provider_for("google/gemini-3.6-flash") == {"order": ["google-ai-studio"], "zdr": True,
+                                                              "data_collection": "deny"}
+    assert pipeline.tts_body("Привет.")["provider"] == {"zdr": True, "data_collection": "deny"}
+
+
+def test_zdr_off_leaves_routing_alone(monkeypatch):
+    monkeypatch.setattr(pipeline, "ZDR", False)
+    monkeypatch.setenv("LIVE_LLM_PROVIDER", "")
+    assert pipeline.provider_for("google/gemini-3.6-flash") is None
+    assert "provider" not in pipeline.tts_body("Привет.")
+
+
+def test_reasoning_per_model(monkeypatch):
+    monkeypatch.setattr(pipeline, "REASONING", "")
+    assert pipeline.reasoning_for("deepseek/deepseek-v4.1-flash") == {"enabled": False}
+    assert pipeline.reasoning_for("google/gemini-3.6-flash") == {"effort": "minimal"}
+    assert pipeline.reasoning_for("google/gemini-3.5-flash-lite") is None
+    monkeypatch.setattr(pipeline, "REASONING", "low")
+    assert pipeline.reasoning_for("deepseek/deepseek-v4.1-flash") == {"effort": "low"}
 
 
 def test_two_failures_surface(monkeypatch, fake_vad):
@@ -247,3 +289,100 @@ def test_end_dialog_closes_the_dialog_at_once(tmp_path, monkeypatch, fake_vad):
     assert b"A" not in [t for t, _ in got] and seen["tts"] == []
     assert len(seen["chat"]) == 1
     assert took < 3
+
+
+# ---- the first turn: the agent is asked with the transcript beside the model round ----
+
+TRANSCRIPT = "Какая погода будет завтра?"
+
+
+def race_fakes(seen, model_answers_itself=False):
+    async def chat(req):
+        body = await req.json()
+        seen["chat"].append(body)
+        users = [m for m in body["messages"] if m["role"] == "user"]
+        if any(m.get("role") == "tool" for m in body["messages"][-2:]):
+            ev = [{"choices": [{"delta": {"content": "Готово."}}]}]
+        elif model_answers_itself and len(users) == 1:
+            ev = [{"choices": [{"delta": {"content": "Сама отвечу."}}]}]
+        else:
+            await asyncio.sleep(0.3)  # the model thinks; the agent is already at work
+            ev = [{"choices": [{"delta": {"tool_calls": [{"index": 0, "id": f"c{len(users)}", "function": {
+                "name": "ask_hermes", "arguments": json.dumps({"request": f"просьба модели {len(users)}"},
+                                                              ensure_ascii=False)}}]}}]}]
+        seen["chat_done"].append(time.monotonic())
+        return web.Response(text=sse(*ev), content_type="text/event-stream")
+
+    async def speech(req):
+        seen["tts"].append((await req.json())["input"])
+        return web.Response(body=b"\x10\x00" * 2400)  # one A frame: each turn's answer is one frame
+
+    async def transcriptions(req):
+        await req.post()
+        return web.json_response({"text": TRANSCRIPT})
+
+    async def hermes(req):
+        seen["hermes"].append((time.monotonic(), (await req.json())["messages"][-1]["content"]))
+        return web.json_response({"choices": [{"message": {"content": "Плюс десять, облачно."}}]})
+
+    app = web.Application()
+    app.router.add_post("/chat/completions", chat)
+    app.router.add_post("/audio/speech", speech)
+    app.router.add_get("/key", lambda req: web.json_response({}))
+    app.router.add_post("/stt/audio/transcriptions", transcriptions)
+    app.router.add_post("/hermes/v1/chat/completions", hermes)
+    return app
+
+
+def run_race(tmp_path, monkeypatch, turns=1, model_answers_itself=False):
+    seen = {"chat": [], "chat_done": [], "tts": [], "hermes": []}
+    monkeypatch.setattr(pipeline, "OR_KEY", "test-key")
+    monkeypatch.setattr(pipeline, "AGENT_RACE", True)
+    monkeypatch.setattr(agent, "AGENT", "hermes")
+    monkeypatch.setattr(session, "IDLE_S", 0.4)
+    monkeypatch.setattr(stt, "INPUT", "text")
+
+    async def go():
+        runner, port = await serve_app(race_fakes(seen, model_answers_itself))
+        monkeypatch.setattr(pipeline, "OR_BASE", f"http://127.0.0.1:{port}")
+        monkeypatch.setattr(stt, "URL", f"http://127.0.0.1:{port}/stt")
+        monkeypatch.setattr(agent, "HERMES_URL", f"http://127.0.0.1:{port}/hermes/v1/chat/completions")
+        routes = tmp_path / "routes.json"
+        routes.write_text(json.dumps({"default": "pipeline"}))
+        async with aiohttp.ClientSession() as http:
+            server = await bridge.serve("127.0.0.1:0", Routes(routes), http)
+            r, w = await station(server.sockets[0].getsockname()[1])
+            got = []
+            for _ in range(turns):
+                for _ in range(20):
+                    w.write(wire.frame(b"A", LOUDER))
+                for _ in range(25):
+                    w.write(wire.frame(b"A", QUIET))
+                got += await frames_until(r, {b"A"})
+                w.write(wire.frame(b"D"))
+                await asyncio.sleep(0.1)
+            got += await frames_until(r, {b"X"})
+            server.close()
+            await runner.cleanup()
+            return got
+    return seen, asyncio.run(go())
+
+
+def test_the_first_turn_asks_the_agent_while_the_model_decides(tmp_path, monkeypatch, fake_vad):
+    seen, got = run_race(tmp_path, monkeypatch)
+    # one agent request, with the transcript, sent before the model had decided to make it
+    assert [c for _, c in seen["hermes"]] == [f"@@LIVE@@ {TRANSCRIPT}"]
+    assert seen["hermes"][0][0] < seen["chat_done"][0]
+    assert seen["tts"] == ["Плюс десять, облачно."] and len(seen["chat"]) == 1
+    assert got[-1] == (b"X", b"idle")
+
+
+def test_the_early_request_is_dropped_when_the_model_answers_itself(tmp_path, monkeypatch, fake_vad):
+    seen, got = run_race(tmp_path, monkeypatch, model_answers_itself=True)
+    assert seen["tts"] == ["Сама отвечу."]
+    assert len(seen["hermes"]) <= 1  # it may have reached the agent; its answer is not used
+
+
+def test_later_turns_ask_the_agent_with_the_models_request(tmp_path, monkeypatch, fake_vad):
+    seen, got = run_race(tmp_path, monkeypatch, turns=2)
+    assert [c for _, c in seen["hermes"]] == [f"@@LIVE@@ {TRANSCRIPT}", "@@LIVE@@ просьба модели 2"]

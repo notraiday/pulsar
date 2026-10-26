@@ -44,6 +44,7 @@ def run(tmp_path, monkeypatch, transcript, frames, stt_status=200):
     monkeypatch.setattr(session, "IDLE_S", 0.4)
     monkeypatch.setattr(session, "FIRST_IDLE_S", 1.5)
     monkeypatch.setattr(stt, "KEY", "stt-key")
+    monkeypatch.setattr(pipeline, "AGENT_RACE", False)  # these turns are about the transcript, not the agent
 
     async def go():
         runner, port = await serve_app(fakes(seen, transcript, stt_status))

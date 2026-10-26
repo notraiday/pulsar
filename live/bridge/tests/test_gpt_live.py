@@ -67,7 +67,12 @@ def fake_hermes(seen):
     return app
 
 
-async def with_bridge(tmp_path, monkeypatch, seen, scenario, reject=False, key="sk-test"):
+async def with_bridge(tmp_path, monkeypatch, seen, scenario, reject=False, key="sk-test", org_zdr=True):
+    monkeypatch.setattr(gpt_live, "ZDR", True)
+    if org_zdr:
+        monkeypatch.setenv("LIVE_GPT_ZDR", "1")
+    else:
+        monkeypatch.delenv("LIVE_GPT_ZDR", raising=False)
     if key:
         monkeypatch.setenv("OPENAI_API_KEY", key)
     else:
@@ -128,6 +133,16 @@ def test_missing_key_hands_the_dialog_off(tmp_path, monkeypatch, fake_vad):
         r, w = await station(port)
         return await frames_until(r, {b"R", b"X"})
     assert asyncio.run(with_bridge(tmp_path, monkeypatch, {}, scenario, key="")) == [(b"R", b"")]
+
+
+def test_without_zdr_at_openai_the_dialog_is_handed_off(tmp_path, monkeypatch, fake_vad):
+    seen = {}
+
+    async def scenario(port):
+        r, w = await station(port)
+        return await frames_until(r, {b"R", b"X"})
+    assert asyncio.run(with_bridge(tmp_path, monkeypatch, seen, scenario, org_zdr=False)) == [(b"R", b"")]
+    assert "start" not in seen  # nothing went to OpenAI
 
 
 def test_rejected_session_hands_the_dialog_off(tmp_path, monkeypatch, fake_vad):

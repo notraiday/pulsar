@@ -4,7 +4,7 @@ K=os.environ["OPENROUTER_API_KEY"]; P=os.environ.get("LIVE_OR_PROXY")
 def fr(t,p=b""): return t+struct.pack("<I",len(p))+p
 async def main():
     async with aiohttp.ClientSession() as h:
-        r=await h.post("https://openrouter.ai/api/v1/audio/speech",headers={"Authorization":"Bearer "+K},proxy=P,json={"model":"google/gemini-3.8-flash-tts","input":os.environ.get("Q","Какая сейчас температура в гостиной?"),"voice":"Puck","response_format":"pcm"})
+        r=await h.post("https://openrouter.ai/api/v1/audio/speech",headers={"Authorization":"Bearer "+K},proxy=P,json={"model":"google/gemini-3.8-flash-tts","input":os.environ.get("Q","Какая сейчас температура в гостиной?"),"voice":"Puck","response_format":"pcm","provider":{"zdr":True,"data_collection":"deny"}})
         pcm24=await r.read()
     pcm16,_=audioop.ratecv(pcm24,2,1,24000,16000,None)
     rd,wr=await asyncio.open_connection("127.0.0.1",int(os.environ.get("PORT","10700"))); wr.write(fr(b"H",b"{}"))

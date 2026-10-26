@@ -7,6 +7,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent.parent  # live/bridge/
 TAG_RE = re.compile(r"\[(?:emo:[a-z]+|SILENT)\]", re.I)
 
+# Zero data retention: what the bridge sends to the cloud goes only to endpoints that keep none of it (OpenRouter's
+# provider.zdr; backends that cannot promise that refuse to run). LIVE_ZDR=0 lifts it.
+ZDR = os.environ.get("LIVE_ZDR", "1") != "0"
+
 
 class BackendUnavailable(Exception):
     """Raised by a backend before it has said anything to the station: the bridge then hands the dialog off."""

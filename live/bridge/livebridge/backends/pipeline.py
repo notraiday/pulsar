@@ -11,6 +11,13 @@ answer has played, or when the station ends it.
 A dialog the house starts (the hello carries "reminder": a station turned HA's start_conversation into it) opens with
 that text spoken on every station that got it, and only the one that hears the owner loudest goes on (reminders.py).
 
+The first turn of a dialog the owner opened has nothing before it to resolve: its transcript is already a
+self-contained request. The agent is asked with it at once, beside the model's round; when the model asks the agent
+too (nearly every first turn is a command), it gets that request's answer, ~0.5 s sooner (LIVE_AGENT_RACE=0: off).
+
+Zero data retention (util.ZDR, on unless LIVE_ZDR=0): every OpenRouter request (model and TTS) carries
+provider.zdr, and the default endpoints of each model are ZDR ones (Gemini: Vertex only, AI Studio keeps data).
+
 Options (routes.json): llm, tts_voice, instructions (a file); the agent's: agent, ha_agent_id, ha_device_id,
 ha_satellite_id (agent.py).
 """
@@ -28,7 +35,7 @@ import aiohttp
 from .. import reminders, stt
 from ..agent import Agent
 from ..session import Session
-from ..util import BackendUnavailable, HERE, clean_for_speech, read_instructions, wav16k
+from ..util import ZDR, BackendUnavailable, HERE, clean_for_speech, read_instructions, wav16k
 from ..wire import Station, frame
 
 log = logging.getLogger("live")
@@ -36,9 +43,12 @@ log = logging.getLogger("live")
 OR_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OR_BASE = os.environ.get("OPENROUTER_BASE", "https://openrouter.ai/api/v1")
 OR_PROXY = os.environ.get("LIVE_OR_PROXY") or None  # OpenRouter refuses some countries' IPs
-REASONING = os.environ.get("LIVE_REASONING", "minimal")  # chat model reasoning effort, "" = default
-LLM = os.environ.get("LIVE_LLM", "google/gemini-3.6-flash")  # 3.8-flash: ~3 s to first token, 3.6: ~1.5 s, same tool use
-TTS = os.environ.get("LIVE_TTS", "elevenlabs/eleven-turbo-v2.5")  # ~0.45 s to first audio; google/gemini-3.8-flash-tts takes 1.6-4.5 s
+REASONING = os.environ.get("LIVE_REASONING", "")  # "" = per model (reasoning_for), "off", or an effort: minimal, low, ...
+# The chat model decides (ask the agent / answer / end) on a transcript. Measured 2026-10-27 on 42 real turns, ZDR
+# endpoints, median / p90 to the decision: deepseek-v4.1-flash (Together, Baseten) 0.53 / 0.76 s, gemini-3.5-flash-lite
+# (Vertex) 0.71 / 1.01 s, gemini-3.6-flash (Vertex) 0.93 / 1.50 s; the same decisions (Gemini 3.6 a little worse).
+LLM = os.environ.get("LIVE_LLM", "deepseek/deepseek-v4.1-flash")
+TTS = os.environ.get("LIVE_TTS", "elevenlabs/eleven-turbo-v2.5")  # ~0.3 s to first audio (eleven-flash-v2.5: the same through OpenRouter); google/gemini-3.8-flash-tts takes 1.6-4.5 s
 TTS_VOICE = os.environ.get("LIVE_TTS_VOICE", "matilda")  # gemini: Kore
 TTS_SPEED = float(os.environ.get("LIVE_TTS_SPEED", "1.1"))  # ElevenLabs accepts 0.7-1.2 through OpenRouter; use 1.0 with gemini
 TTS_STYLE = os.environ.get("LIVE_TTS_STYLE", (
@@ -46,13 +56,42 @@ TTS_STYLE = os.environ.get("LIVE_TTS_STYLE", (
     "дерзость и ирония, без дикторской интонации. Читай только сам текст, ничего не добавляй."))
 DIRECT_MAX = int(os.environ.get("LIVE_DIRECT_MAX", "260"))  # Hermes answers up to this many chars are spoken as they are (0 = always reword)
 LLM_TIMEOUT = float(os.environ.get("LIVE_LLM_TIMEOUT", "60"))
-# OpenRouter load-balances by price; for Gemini that includes the "flex" tiers (median 7-11 s to first token, p99 85 s
-# measured 2026-10-26). Pin the priority endpoints (median ~1.6 s) and never fall back to flex. LIVE_LLM_PROVIDER: JSON, "" = off.
-_PROV = os.environ.get("LIVE_LLM_PROVIDER")
-LLM_PROVIDER = (json.loads(_PROV) if _PROV else None) if _PROV is not None else (
-    {"order": ["google-ai-studio/priority", "google-vertex/global/priority"], "allow_fallbacks": False}
-    if LLM.startswith("google/") else None)
-LLM_HEDGE_S = float(os.environ.get("LIVE_LLM_HEDGE_S", "3.0"))  # nothing useful from the model after this long: race a 2nd identical request (0 = off)
+LLM_HEDGE_S = float(os.environ.get("LIVE_LLM_HEDGE_S", "1.5"))  # nothing useful from the model after this long: race a 2nd identical request (0 = off)
+AGENT_RACE = os.environ.get("LIVE_AGENT_RACE", "1") != "0"  # first turn: the agent is asked with the transcript at once
+ZDR_PROVIDER = {"zdr": True, "data_collection": "deny"}
+COVERED = object()  # run_call: the first ask of the round got the whole utterance
+
+
+def provider_for(model: str) -> dict | None:
+    """OpenRouter routing of the chat model. OpenRouter load-balances by price, which for Gemini includes the "flex"
+    tiers (median 7-11 s to a first token, p99 85 s, measured 2026-10-26): the default pins the fast endpoints and never
+    falls back past them. LIVE_LLM_PROVIDER: JSON instead of the default, "" = none. With ZDR, zdr is always added."""
+    env = os.environ.get("LIVE_LLM_PROVIDER")
+    if env is not None:
+        prov = json.loads(env) if env else {}
+    elif model.startswith("google/"):  # Google's ZDR endpoints are the Vertex ones only
+        prov = {"order": ["google-vertex/global", "google-vertex/global/priority", "google-vertex/us"],
+                "allow_fallbacks": False}
+    elif model.startswith("deepseek/"):  # the fastest ZDR hosts of deepseek-v4.1-flash, ~0.23 s to a first token
+        prov = {"order": ["together", "baseten", "inference-net"], "allow_fallbacks": False}
+    else:
+        prov = {}
+    if ZDR:
+        prov = dict(prov, **ZDR_PROVIDER)
+    return prov or None
+
+
+def reasoning_for(model: str) -> dict | None:
+    if REASONING == "off":
+        return {"enabled": False}
+    if REASONING:
+        return None if "lite" in model else {"effort": REASONING}  # flash-lite takes no reasoning parameters
+    if model.startswith("google/"):
+        return None if "lite" in model else {"effort": "minimal"}
+    if model.startswith("deepseek/"):
+        return {"enabled": False}
+    return None
+
 
 # Added to the persona for a dialog that opened with a reminder (it is not in the history: that starts with the owner).
 REMINDER_NOTE = (
@@ -66,8 +105,9 @@ STT_HINT = "(Расшифровка этой реплики локальным �
 # Added to the persona when the owner's turns come as transcripts alone (LIVE_INPUT=text).
 TEXT_NOTE = (
     "\n\nРеплики хозяина приходят расшифровкой его речи (локальное распознавание), звука ты не слышишь. В расшифровке "
-    "бывают ошибки — понимай по смыслу и по разговору. Если она бессмысленна (шум, обрывок слова) или реплика явно "
-    "обращена не к тебе — выведи ровно [SILENT].")
+    "бывают ошибки — понимай по смыслу и по разговору. Выведи ровно [SILENT] только если расшифровка совсем "
+    "бессмысленна (обрывок слова, случайный набор слов) или это явно чужой разговор или телевизор; любая обычная "
+    "реплика, просьба или подкол — это тебе, отвечай.")
 
 SENT_RE = re.compile(r"(.+?[.!?…]+[\"»)]?)(?:\s+|$)", re.S)
 
@@ -100,6 +140,8 @@ def tts_body(text: str, voice: str = "") -> dict:
         body["speed"] = TTS_SPEED
     if TTS.startswith("google/"):
         body["instructions"] = TTS_STYLE  # only Gemini takes a style prompt
+    if ZDR:
+        body["provider"] = dict(ZDR_PROVIDER)
     return body
 
 
@@ -114,6 +156,7 @@ class Dialog(Session):
         self.http = http
         self.agent = Agent(http, o)
         self.llm = o.get("llm") or LLM
+        self.provider = provider_for(self.llm)
         self.voice = o.get("tts_voice") or TTS_VOICE
         self.instructions_file = o.get("instructions")
         self.instructions = ""
@@ -138,8 +181,9 @@ class Dialog(Session):
             self.instructions = (p if p.is_absolute() else HERE / p).read_text(encoding="utf-8")
         else:
             self.instructions = read_instructions()
-        log.info("dialog from %s: %s (llm %s, tts %s/%s, agent %s)", self.st.peer, self.st.hello, self.llm, TTS,
-                 self.voice, self.agent.describe())
+        log.info("dialog from %s: %s (llm %s%s, tts %s/%s, agent %s)", self.st.peer, self.st.hello, self.llm,
+                 " via " + ",".join(self.provider.get("order") or ["any"]) + (" zdr" if self.provider.get("zdr") else "")
+                 if self.provider else "", TTS, self.voice, self.agent.describe())
         self._warm = asyncio.create_task(self.prewarm())
         if stt.needs_text() and stt.mode() == "text":
             self.instructions += TEXT_NOTE
@@ -149,13 +193,17 @@ class Dialog(Session):
             reminders.join(self, reminder, self.tts_chunks)
 
     async def prewarm(self):
-        """Open the connection to OpenRouter (through the proxy) while the owner is still speaking."""
-        try:
-            async with self.http.get(f"{OR_BASE}/key", headers=or_headers(), proxy=OR_PROXY,
-                                     timeout=aiohttp.ClientTimeout(total=8)) as r:
-                await r.read()
-        except Exception:
-            pass
+        """Open two connections to OpenRouter while the owner is still speaking: through the proxy a new one costs
+        ~0.3 s more than a kept one (0.34 s against 0.07 s), and the model's stream and the TTS of its first sentence
+        run side by side."""
+        async def one():
+            try:
+                async with self.http.get(f"{OR_BASE}/key", headers=or_headers(), proxy=OR_PROXY,
+                                         timeout=aiohttp.ClientTimeout(total=8)) as r:
+                    await r.read()
+            except Exception:
+                pass
+        await asyncio.gather(one(), one())
 
     def working(self) -> bool:
         return any(not t.done() for t in self.tools.values())
@@ -301,11 +349,24 @@ class Dialog(Session):
                     self.set_state("listening")
                 return
             self.add_user_turn(pcm, text, forced)
+            early = self.race(text)
+        else:
+            early = None
         q: asyncio.Queue = asyncio.Queue()
         self.tts_task = asyncio.create_task(self.tts_worker(q))
         try:
             for _round in range(4):
                 calls = await self.llm_round(q)
+                pre = {}  # call id -> the early request that answers it
+                if early is not None:
+                    asks = [c for c in calls if c["name"] == "ask_hermes"]
+                    if asks:
+                        # the agent got the whole utterance: further asks of this round are covered by it
+                        pre = {asks[0]["id"]: early, **{c["id"]: COVERED for c in asks[1:]}}
+                    else:
+                        log.info("the model did not ask the agent: the early request is dropped")
+                        early.cancel()
+                    early = None
                 if not calls:
                     break
                 self.shrink_audio(calls)
@@ -327,7 +388,7 @@ class Dialog(Session):
                         self.asked[c["id"]] = json.loads(c["args"] or "{}").get("request", "")
                     except ValueError:
                         pass
-                    t = asyncio.create_task(self.run_call(c))
+                    t = asyncio.create_task(self.run_call(c, pre.get(c["id"])))
                     self.tools[c["id"]] = t
                     t.add_done_callback(lambda t, c=c: self.tool_done(c, t))
                     tasks.append(t)
@@ -351,10 +412,21 @@ class Dialog(Session):
             log.warning("response failed: %r", e)
             self.tts_task.cancel()
         finally:
+            if early is not None:
+                early.cancel()  # cut short before the model decided
             self.turn_open = False
             self.touch()
             if not self.speaking and not self.ending:
                 self.set_state("listening")
+
+    def race(self, text: str | None):
+        """The first turn of a dialog the owner opened: ask the agent with the transcript now, beside the model round
+        (see the module doc). None when this turn is not one."""
+        if not (AGENT_RACE and stt.has_words(text) and self.group is None and not self.st.hello.get("reminder")
+                and sum(1 for m in self.history if m.get("role") == "user") == 1):
+            return None
+        log.info("first turn: the agent is asked with the transcript beside the model round")
+        return self.spawn(self.ask_agent(text))
 
     def direct_answer(self, calls, results) -> str:
         """A short Hermes answer is already in the right words (its voice profile carries the persona):
@@ -413,7 +485,8 @@ class Dialog(Session):
                 (ch.get("delta") or {}).get("content") or (ch.get("delta") or {}).get("tool_calls")
                 for ch in ev.get("choices") or [])
 
-        tasks = {0: asyncio.create_task(one(0, LLM_PROVIDER))}
+        prov = self.provider
+        tasks = {0: asyncio.create_task(one(0, prov))}
         t0, winner, hedged = time.monotonic(), None, False
         try:
             while True:
@@ -425,7 +498,7 @@ class Dialog(Session):
                 except asyncio.TimeoutError:
                     hedged = True
                     log.info("llm silent for %.1fs, racing a second request", LLM_HEDGE_S)
-                    other = dict(LLM_PROVIDER, order=LLM_PROVIDER["order"][::-1]) if LLM_PROVIDER else None
+                    other = dict(prov, order=prov["order"][::-1]) if prov and prov.get("order") else prov
                     tasks[1] = asyncio.create_task(one(1, other))  # the other provider first
                     continue
                 if winner is not None and idx != winner:
@@ -437,8 +510,9 @@ class Dialog(Session):
                             continue  # the other request may still deliver
                         if not hedged and LLM_HEDGE_S > 0:
                             hedged = True
-                            log.warning("llm request failed (%s), retrying once without provider pinning", str(val)[:120])
-                            tasks[1] = asyncio.create_task(one(1, None))
+                            log.warning("llm request failed (%s), retrying once without provider pinning%s",
+                                        str(val)[:120], " (ZDR endpoints only)" if ZDR else "")
+                            tasks[1] = asyncio.create_task(one(1, dict(ZDR_PROVIDER) if ZDR else None))
                             continue
                     raise RuntimeError(val)
                 if kind == "end":
@@ -462,8 +536,9 @@ class Dialog(Session):
         self.prepare_history()
         body = {"model": self.llm, "stream": True, "tools": TOOLS,
                 "messages": [{"role": "system", "content": self.instructions}] + self.history}  # provider pinning: llm_events
-        if REASONING and "lite" not in self.llm:
-            body["reasoning"] = {"effort": REASONING}
+        reasoning = reasoning_for(self.llm)
+        if reasoning:
+            body["reasoning"] = reasoning
         headers = or_headers()
         t0 = time.monotonic()
         text, pending, calls, first, tool_seen = "", "", {}, True, False
@@ -548,7 +623,8 @@ class Dialog(Session):
                 self.send(frame(b"A", pcm))
                 await self.st.drain()
 
-    async def run_call(self, c) -> str:
+    async def run_call(self, c, early=None) -> str:
+        """`early`: the request the race started for this call (race()), or COVERED: that request covers it too."""
         try:
             args = json.loads(c["args"] or "{}")
         except ValueError:
@@ -557,14 +633,22 @@ class Dialog(Session):
         if c["name"] == "ask_hermes":
             if not self.speaking:
                 self.set_state("thinking")
-            try:
-                return await self.agent.ask(str(args.get("request", "")))
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                log.warning("agent failed: %r", e)
-                return f"Агент не ответил: {e}"[:300]
+            if early is COVERED:
+                return "Сделано вместе с первой просьбой: агент получил всю реплику хозяина целиком."
+            if early is not None:
+                log.info("the model asked the agent: it gets the request already running")
+                return await early
+            return await self.ask_agent(str(args.get("request", "")))
         return f"unknown tool {c['name']}"
+
+    async def ask_agent(self, request: str) -> str:
+        try:
+            return await self.agent.ask(request)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("agent failed: %r", e)
+            return f"Агент не ответил: {e}"[:300]
 
 
 async def run(station: Station, http: aiohttp.ClientSession, options: dict):
