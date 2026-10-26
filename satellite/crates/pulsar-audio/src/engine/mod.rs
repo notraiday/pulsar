@@ -111,6 +111,13 @@ pub(crate) trait EventSource {
     fn phrase(&mut self) -> String;
 }
 
+/// The activation models of the Mini 3 firmware carry a second config next to the keyword, a
+/// human-VAD stage (`spotter_models/activation/*/1/words.txt`: `<speech_started>`,
+/// `<speech_finished>`). It confirms through the same events as the keyword, on any speech.
+fn is_vad_marker(phrase: &str) -> bool {
+    phrase.starts_with('<') && phrase.ends_with('>')
+}
+
 /// Reads the events of one fed chunk (at most 16, until a stop event) and returns the confirmed
 /// phrases, one per utterance (`DEBOUNCE_MS` after the previous hit).
 pub(crate) fn drain_events(
@@ -129,6 +136,9 @@ pub(crate) fn drain_events(
             continue;
         }
         let phrase = src.phrase();
+        if is_vad_marker(&phrase) {
+            continue;
+        }
         let now = now_ms();
         if now - *last_hit_ms < DEBOUNCE_MS {
             continue;
@@ -481,6 +491,32 @@ mod tests {
         let mut last = 0;
         assert_eq!(drain_events(&mut s, "t", &mut last, || 5000), ["p1"]);
         assert_eq!((s.polled, s.phrases, last), (6, 1, 5000));
+    }
+
+    #[test]
+    fn vad_markers_are_not_hits_and_do_not_debounce() {
+        struct Phrases(Vec<&'static str>, usize);
+        impl EventSource for Phrases {
+            fn next_event(&mut self) -> Option<i32> {
+                Some(if self.1 < self.0.len() { 2 } else { 0 })
+            }
+            fn phrase(&mut self) -> String {
+                self.1 += 1;
+                self.0[self.1 - 1].to_owned()
+            }
+        }
+        let mut last = 0;
+        let mut s = Phrases(vec!["<speech_started>", "алиса", "<speech_finished>"], 0);
+        assert_eq!(drain_events(&mut s, "t", &mut last, || 7000), ["алиса"]);
+        assert_eq!(last, 7000);
+        // A marker right after a hit neither hits nor restarts the debounce window.
+        let mut s = Phrases(vec!["<speech_started>"], 0);
+        assert!(drain_events(&mut s, "t", &mut last, || 7100).is_empty());
+        assert_eq!(last, 7000);
+        // A marker with no hit before it leaves the window open for a real phrase.
+        let mut last = 0;
+        let mut s = Phrases(vec!["<speech_started>", "алиса"], 0);
+        assert_eq!(drain_events(&mut s, "t", &mut last, || 5000), ["алиса"]);
     }
 
     #[test]

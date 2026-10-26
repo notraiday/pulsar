@@ -251,6 +251,11 @@ in that firmware's `maind`:
   inside any call ends in `quick_exit(1)`.
 - Verified with `ww_offline` on the station: all VQE output types the spotters need (9, 2, 6)
   exist, alisa takes 3 channels, yandex 2, command 1.
+- The activation models of that firmware are two configs (`n-configs 2`): `0` is the keyword
+  (`алиса` / `яндекс`), `1` a human-VAD stage (`seam-vad-decoder`, words `<speech_started>` /
+  `<speech_finished>`). The VAD stage confirms through the same events 2 / 5 on any speech, so
+  without a filter every spoken word started a dialog; `engine::is_vad_marker` drops phrases of the
+  form `<…>` before the debounce. Real hits carry the keyword as the phrase.
 
 ## Zigbee radio (Midi, `satellite/crates/pulsar-zigbee/`)
 
