@@ -508,6 +508,26 @@ impl Controller {
     /// async_internal_announce), so a dialog still active here is either ending (its RUN_END or
     /// the watchdog follows) or was started by HA after the announcement.
     pub(super) fn on_announce(&mut self, req: AnnounceRequest) {
+        // HA's start_conversation (a reminder): with a bridge, a Live dialog that opens with its
+        // text; the bridge speaks it and listens for the answer.
+        if req.start_conversation
+            && !req.text.trim().is_empty()
+            && self.phase == Phase::Idle
+            && !self.live_active()
+            && !self.announcing
+            && !self.timer_ringing
+            && !self.mic_muted()
+            && let Some(bridge) = self.live_bridge()
+        {
+            info!("announce: '{}' opens a Live dialog", req.text);
+            return self.start_live_with(bridge, Vec::new(), Some(req));
+        }
+        self.announce_classic(req);
+    }
+
+    /// The announcement played here (pre-announce sound, then the media), then the HA pipeline
+    /// when it was a start_conversation.
+    pub(super) fn announce_classic(&mut self, req: AnnounceRequest) {
         info!(
             "announce: '{}'{}",
             req.text,

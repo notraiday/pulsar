@@ -1,10 +1,12 @@
 //! Live dialogs through the bridge (`pulsar-live`): the speaker only streams the microphone and
 //! plays what comes back; the bridge decides what a dialog is, and may hand it to the Home
 //! Assistant pipeline instead. Without a bridge address, or when the bridge cannot be reached,
-//! the HA pipeline answers as before.
+//! the HA pipeline answers as before. HA's `start_conversation` (a reminder, say) opens a dialog
+//! too: the bridge speaks its text and listens for the answer.
 
 use log::{info, warn};
 use pulsar_core::UiState;
+use pulsar_esphome::AnnounceRequest;
 use pulsar_live::{End, EndKind, LiveEvent, LiveState, StartParams};
 use pulsar_media::Channel;
 
@@ -21,6 +23,9 @@ pub(super) struct Dialog {
     id: u64,
     closing: bool,
     ui: UiState,
+    /// The HA announcement (start_conversation) this dialog opens with, until the bridge takes it
+    /// (its first state). One the bridge never takes is played the classic way.
+    reminder: Option<AnnounceRequest>,
 }
 
 impl Dialog {
@@ -54,6 +59,20 @@ fn json_str(s: &str) -> String {
     out
 }
 
+/// The hello frame; `reminder`: the text a dialog opened by HA starts with.
+fn hello_json(wake_word: &str, station: &str, reminder: Option<&str>) -> String {
+    let mut s = format!(
+        r#"{{"wake_word":{},"station":{},"protocol":1"#,
+        json_str(wake_word),
+        json_str(station)
+    );
+    if let Some(text) = reminder {
+        s.push_str(&format!(r#","reminder":{}"#, json_str(text)));
+    }
+    s.push('}');
+    s
+}
+
 impl Controller {
     /// A dialog is running or its last words are playing.
     pub(super) fn live_active(&self) -> bool {
@@ -83,6 +102,17 @@ impl Controller {
 
     /// `preroll`: what was said since the wake word (16 kHz), sent first.
     pub(super) fn start_live(&mut self, bridge: String, preroll: Vec<i16>) {
+        self.start_live_with(bridge, preroll, None);
+    }
+
+    /// `reminder`: HA's announcement the dialog opens with (no wake earcon then: the bridge
+    /// speaks first).
+    pub(super) fn start_live_with(
+        &mut self,
+        bridge: String,
+        preroll: Vec<i16>,
+        reminder: Option<AnnounceRequest>,
+    ) {
         self.cancel_arbitration();
         if self.live_active() {
             self.teardown_live(); // the last words of an ended dialog give way to this one
@@ -90,12 +120,20 @@ impl Controller {
         if self.phase != Phase::Idle {
             self.finish_interaction();
         }
-        info!("live: starting a dialog via {bridge}");
-        let hello = format!(
-            r#"{{"wake_word":{},"station":{},"protocol":1}}"#,
-            json_str(&self.st.wake_word),
-            json_str(&self.station)
+        info!(
+            "live: starting a dialog via {bridge}{}",
+            if reminder.is_some() {
+                " (reminder)"
+            } else {
+                ""
+            }
         );
+        let hello = hello_json(
+            &self.st.wake_word,
+            &self.station,
+            reminder.as_ref().map(|r| r.text.as_str()),
+        );
+        let earcon = reminder.is_none();
         let id = self.live.start(StartParams {
             bridge,
             hello,
@@ -105,10 +143,13 @@ impl Controller {
             id,
             closing: false,
             ui: UiState::Listening,
+            reminder,
         });
         self.commands_blocked_until_ms = 0;
-        let sound = format!("{SOUNDS}{}", self.model.wake_sound);
-        self.player.play(Channel::Announce, vec![sound]);
+        if earcon {
+            let sound = format!("{SOUNDS}{}", self.model.wake_sound);
+            self.player.play(Channel::Announce, vec![sound]);
+        }
         self.mic.set_streaming(true);
         self.timers.set(Tk::LiveMax, LIVE_MAX_MS);
         self.update_duck();
@@ -131,6 +172,13 @@ impl Controller {
     }
 
     pub(super) fn teardown_live(&mut self) {
+        if self
+            .live_dialog
+            .as_mut()
+            .is_some_and(|d| d.reminder.take().is_some())
+        {
+            self.api.voice_announce_finished(false); // HA waits for every announcement's end
+        }
         self.timers.cancel(Tk::LiveMax);
         self.timers.cancel(Tk::LiveTail);
         self.live.teardown();
@@ -148,12 +196,19 @@ impl Controller {
         match ev {
             LiveEvent::Connected { .. } => {}
             LiveEvent::State { id: i, state } if i == id => {
+                let mut taken = None;
                 if let Some(d) = &mut self.live_dialog {
                     d.ui = match state {
                         LiveState::Listening => UiState::Listening,
                         LiveState::Thinking => UiState::Thinking,
                         LiveState::Speaking => UiState::Speaking,
                     };
+                    taken = d.reminder.take();
+                }
+                if taken.is_some() {
+                    // The bridge speaks it: HA's announcement is over as far as HA is concerned.
+                    info!("live: the bridge took the reminder");
+                    self.api.voice_announce_finished(true);
                 }
                 self.update_ui();
             }
@@ -169,6 +224,17 @@ impl Controller {
     }
 
     fn live_ended(&mut self, end: End) {
+        // A reminder the bridge never took is played as HA meant it: the announcement, then the
+        // HA pipeline.
+        let untaken = self.live_dialog.as_mut().and_then(|d| d.reminder.take());
+        if let Some(req) = untaken {
+            warn!(
+                "live: {} before the reminder was taken, announcing it instead",
+                end.reason
+            );
+            self.teardown_live();
+            return self.announce_classic(req);
+        }
         match end.kind {
             // No dialog happened, or the bridge declined it: Home Assistant answers with what
             // was said meanwhile.
@@ -207,7 +273,19 @@ impl Controller {
 
 #[cfg(test)]
 mod tests {
-    use super::json_str;
+    use super::{hello_json, json_str};
+
+    #[test]
+    fn the_hello_carries_a_reminder_only_when_there_is_one() {
+        assert_eq!(
+            hello_json("alisa", "kitchen", None),
+            r#"{"wake_word":"alisa","station":"kitchen","protocol":1}"#
+        );
+        assert_eq!(
+            hello_json("alisa", "kitchen", Some("Выключи \"чайник\"")),
+            r#"{"wake_word":"alisa","station":"kitchen","protocol":1,"reminder":"Выключи \"чайник\""}"#
+        );
+    }
 
     #[test]
     fn json_strings_are_escaped() {
