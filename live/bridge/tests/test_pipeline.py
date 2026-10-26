@@ -199,3 +199,51 @@ def test_a_spoken_question_goes_through_the_agent_and_is_answered_aloud(tmp_path
     assert len(seen["chat"]) == 1
     # the question went to the model as audio
     assert seen["chat"][0]["messages"][1]["content"][0]["type"] == "input_audio"
+
+
+def test_end_dialog_closes_the_dialog_at_once(tmp_path, monkeypatch, fake_vad):
+    """"Ок, спасибо": the model calls end_dialog alone; no second model round, nothing spoken, X right away."""
+    seen = {"chat": [], "tts": []}
+    monkeypatch.setattr(session, "IDLE_S", 30)        # the end must not come from the idle timer
+    monkeypatch.setattr(session, "FIRST_IDLE_S", 30)
+    monkeypatch.setattr(pipeline, "OR_KEY", "test-key")
+    monkeypatch.setattr(agent, "AGENT", "hermes")
+
+    async def chat(req):
+        seen["chat"].append(await req.json())
+        ev = [{"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "e1", "function": {
+            "name": "end_dialog", "arguments": "{}"}}]}}]}]
+        return web.Response(text=sse(*ev), content_type="text/event-stream")
+
+    async def speech(req):
+        seen["tts"].append((await req.json())["input"])
+        return web.Response(body=b"\x10\x00" * 4800)
+
+    app = web.Application()
+    app.router.add_post("/chat/completions", chat)
+    app.router.add_post("/audio/speech", speech)
+    app.router.add_get("/key", lambda req: web.json_response({}))
+
+    async def go():
+        runner, port = await serve_app(app)
+        monkeypatch.setattr(pipeline, "OR_BASE", f"http://127.0.0.1:{port}")
+        routes = tmp_path / "routes.json"
+        routes.write_text(json.dumps({"default": "pipeline"}))
+        async with aiohttp.ClientSession() as http:
+            server = await bridge.serve("127.0.0.1:0", Routes(routes), http)
+            r, w = await station(server.sockets[0].getsockname()[1])
+            for _ in range(20):
+                w.write(wire.frame(b"A", LOUDER))
+            for _ in range(25):
+                w.write(wire.frame(b"A", QUIET))
+            t0 = time.monotonic()
+            got = await frames_until(r, {b"X"}, timeout=5)
+            took = time.monotonic() - t0
+            server.close()
+            await runner.cleanup()
+            return got, took
+    got, took = asyncio.run(go())
+    assert got[-1] == (b"X", b"goodbye")
+    assert b"A" not in [t for t, _ in got] and seen["tts"] == []
+    assert len(seen["chat"]) == 1
+    assert took < 3

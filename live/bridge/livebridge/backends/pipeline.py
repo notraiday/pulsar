@@ -4,7 +4,8 @@ TTS model) with the home agent behind the ask_hermes tool (through Home Assistan
 The VAD in Session does the turn-taking: it finds the end of an utterance, which goes to the chat model as audio;
 the reply text is cut into sentences and each sentence is synthesised and streamed to the station while the model
 keeps writing. Speech over the answer cancels all of it (barge-in); tool calls keep running through a barge-in and
-their results are spoken later. The dialog ends when the model calls end_dialog, after IDLE_S of silence once the
+their results are spoken later. The dialog ends when the model calls end_dialog (at once: no further model round,
+only what it said alongside is played out), after IDLE_S of silence once the
 answer has played, or when the station ends it.
 
 Options (routes.json): llm, tts_voice, instructions (a file); the agent's: agent, ha_agent_id, ha_device_id,
@@ -66,8 +67,10 @@ TOOLS = [
             "required": ["request"]}}},
     {"type": "function", "function": {
         "name": "end_dialog",
-        "description": "End the conversation: call it when the user says goodbye, thanks you and is done, or "
-                       "tells you to stop listening. Say a very short goodbye first.",
+        "description": "End the conversation right now. Call it, without saying anything, as soon as the owner is "
+                       "done: thanks you and wants nothing more ('ок, спасибо', 'спасибо, всё', 'понял, спасибо'), "
+                       "says goodbye, 'хватит', 'отбой', or tells you to stop listening. The station stops listening "
+                       "at once; there is no next turn.",
         "parameters": {"type": "object", "properties": {}}}},
 ]
 
@@ -241,6 +244,18 @@ class Dialog(Session):
                 if not calls:
                     break
                 self.shrink_audio(calls)
+                # end_dialog takes effect at once: the dialog closes as soon as whatever was said in this round has
+                # been played. Only a request made alongside still gets its answer (spoken as it is, or put into
+                # words by one more round when it is long).
+                ends = [c for c in calls if c["name"] == "end_dialog"]
+                if ends:
+                    log.info("end_dialog: the owner is done")
+                    self.ending = "goodbye"
+                    for c in ends:
+                        self.history.append({"role": "tool", "tool_call_id": c["id"], "content": "ok"})
+                    calls = [c for c in calls if c["name"] != "end_dialog"]
+                    if not calls:
+                        break
                 tasks = []
                 for c in calls:
                     t = asyncio.create_task(self.run_call(c))
@@ -275,7 +290,7 @@ class Dialog(Session):
     def direct_answer(self, calls, results) -> str:
         """A short Hermes answer is already in the right words (its voice profile carries the persona):
         speak it as it is and skip the second model round (~2 s)."""
-        if (not DIRECT_MAX or self.carry or self.ending or len(calls) != 1 or calls[0]["name"] != "ask_hermes"
+        if (not DIRECT_MAX or self.carry or len(calls) != 1 or calls[0]["name"] != "ask_hermes"
                 or self.has_unspoken_results()):  # an earlier interrupted request is ready: let the model say both
             return ""
         text = clean_for_speech(results[0])
@@ -466,9 +481,6 @@ class Dialog(Session):
         except ValueError:
             args = {}
         log.info("tool %s %s", c["name"], args)
-        if c["name"] == "end_dialog":
-            self.ending = "goodbye"
-            return "ok"
         if c["name"] == "ask_hermes":
             if not self.speaking:
                 self.set_state("thinking")
