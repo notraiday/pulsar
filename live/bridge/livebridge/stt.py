@@ -1,9 +1,11 @@
-"""Local speech-to-text: an OpenAI-compatible /audio/transcriptions server (e.g. GigaAM) as a second opinion on what
-the owner said. With LIVE_STT_URL set:
-  * an utterance too short for the VAD (under MIN_SPEECH_MS voiced, a quick "удали их") is transcribed, and kept
-    when the transcript has words;
-  * every utterance's transcript goes to the log;
-  * LIVE_STT_HINT (on by default): the transcript also goes to the model next to the audio (it waits for it, ~0.3 s).
+"""Local speech-to-text: an OpenAI-compatible /audio/transcriptions server (e.g. GigaAM). With LIVE_STT_URL set:
+  * LIVE_INPUT says what the model gets of a turn: "text" (default: the transcript alone; measured on real
+    utterances, Gemini's first action comes after a median 1.09 s instead of 1.79 s with the sound), "both" (the
+    transcript next to the sound) or "audio" (the sound alone, as without an STT);
+  * the transcript is started ahead, at SPEC_MS of silence, while the turn detector still waits for the end of the
+    utterance: it is ready (or nearly) when the turn ends;
+  * an utterance too short for the VAD (under MIN_SPEECH_MS voiced, a quick "удали их") is kept when its transcript
+    has words; every transcript goes to the log.
 """
 import asyncio
 import logging
@@ -22,7 +24,8 @@ KEY = os.environ.get("LIVE_STT_KEY", "")
 MODEL = os.environ.get("LIVE_STT_MODEL", "v3_e2e_rnnt")
 LANGUAGE = os.environ.get("LIVE_STT_LANGUAGE", "ru")
 TIMEOUT = float(os.environ.get("LIVE_STT_TIMEOUT", "3"))
-HINT = os.environ.get("LIVE_STT_HINT", "1") != "0"
+INPUT = os.environ.get("LIVE_INPUT", "")                            # text | both | audio; "" = text with an STT
+SPEC_MS = int(os.environ.get("LIVE_STT_SPEC_MS", "250"))            # silence that starts the transcript ahead
 RESCUE_MIN_MS = int(os.environ.get("LIVE_STT_RESCUE_MIN_MS", "96"))  # shorter "speech" is not worth asking about
 
 WORD_RE = re.compile(r"[^\W\d_]{2,}")
@@ -30,6 +33,14 @@ WORD_RE = re.compile(r"[^\W\d_]{2,}")
 
 def enabled() -> bool:
     return bool(URL)
+
+
+def mode() -> str:
+    return INPUT or ("text" if URL else "audio")
+
+
+def needs_text() -> bool:
+    return enabled() and mode() in ("text", "both")
 
 
 def has_words(text: str | None) -> bool:

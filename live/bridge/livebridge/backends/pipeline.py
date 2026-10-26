@@ -61,8 +61,13 @@ REMINDER_NOTE = (
     "через ask_hermes) или больше не напоминать об этом (тогда попроси ask_hermes удалить это напоминание, назвав "
     "его текст). На «о чём это?» отвечай сама: текст напоминания ты знаешь. Если он просто подтвердил («ок», "
     "«спасибо», «понял») — сразу вызови end_dialog.")
-# The local transcript next to the audio of a turn (stt.py).
+# The local transcript next to the audio of a turn (LIVE_INPUT=both, stt.py).
 STT_HINT = "(Расшифровка этой реплики локальным распознавателем, может ошибаться — сверяй со звуком: «{text}».)"
+# Added to the persona when the owner's turns come as transcripts alone (LIVE_INPUT=text).
+TEXT_NOTE = (
+    "\n\nРеплики хозяина приходят расшифровкой его речи (локальное распознавание), звука ты не слышишь. В расшифровке "
+    "бывают ошибки — понимай по смыслу и по разговору. Если она бессмысленна (шум, обрывок слова) или реплика явно "
+    "обращена не к тебе — выведи ровно [SILENT].")
 
 SENT_RE = re.compile(r"(.+?[.!?…]+[\"»)]?)(?:\s+|$)", re.S)
 
@@ -136,6 +141,8 @@ class Dialog(Session):
         log.info("dialog from %s: %s (llm %s, tts %s/%s, agent %s)", self.st.peer, self.st.hello, self.llm, TTS,
                  self.voice, self.agent.describe())
         self._warm = asyncio.create_task(self.prewarm())
+        if stt.needs_text() and stt.mode() == "text":
+            self.instructions += TEXT_NOTE
         reminder = clean_for_speech(str(self.st.hello.get("reminder") or ""))
         if reminder:
             self.instructions += REMINDER_NOTE.format(text=reminder)
@@ -156,10 +163,12 @@ class Dialog(Session):
     def followup_due(self) -> bool:
         return self.has_unspoken_results()
 
-    def on_utterance(self, pcm: bytes, text: str | None = None):
+    def on_utterance(self, pcm: bytes, text: str | None = None, pending=None):
         if self.group is not None and not self.group.won(self):
+            if pending is not None:
+                pending.cancel()
             return  # another station of the reminder answers
-        self.start_response(pcm, text)
+        self.start_response(pcm, text, pending)
 
     # ---- reply ----
     # ---- tool calls that survive an interruption ----
@@ -247,35 +256,51 @@ class Dialog(Session):
         self.speaking = False
         self.turn_open = False
 
-    def start_response(self, pcm: bytes, text: str | None = None):
-        """`text`: a transcript already made (a short utterance the STT kept); it always goes to the model."""
+    def start_response(self, pcm: bytes, text: str | None = None, pending=None):
+        """`text`: a transcript already made (a short utterance the STT kept: it always goes to the model);
+        `pending`: the transcript being made ahead (stt.py)."""
         self.cancel_response(flush=False)
         self.turn_open = True
         self.set_state("thinking")
-        self.resp = asyncio.create_task(self.respond((pcm, text)))
+        self.resp = asyncio.create_task(self.respond((pcm, text, pending)))
 
-    def add_user_turn(self, pcm: bytes, hint: str | None):
+    def add_user_turn(self, pcm: bytes, text: str | None, forced: bool):
+        """LIVE_INPUT=text: the transcript alone (the sound when there is none: the STT failed); both: the transcript
+        next to the sound; audio: the sound (with a transcript only for a short utterance the STT kept)."""
         for i in [i for i, m in enumerate(self.history) if isinstance(m.get("content"), list)][:-2]:
             self.history[i] = {"role": "user", "content": "(реплика хозяина)"}  # only the last turns keep their sound
-        content = [{"type": "input_audio",
-                    "input_audio": {"data": base64.b64encode(wav16k(pcm)).decode(), "format": "wav"}}]
-        if hint:
-            content.insert(0, {"type": "text", "text": STT_HINT.format(text=hint)})
+        mode = stt.mode()
+        if mode == "text" and text:
+            content = text
+        else:
+            content = [{"type": "input_audio",
+                        "input_audio": {"data": base64.b64encode(wav16k(pcm)).decode(), "format": "wav"}}]
+            if text and (mode == "both" or forced):
+                content.insert(0, {"type": "text", "text": STT_HINT.format(text=text)})
         self.history.append({"role": "user", "content": content})
         del self.history[:-14]
         while self.history and self.history[0].get("role") != "user":
             self.history.pop(0)  # never start with a tool result whose call was trimmed away
 
     async def respond(self, utt=None):
-        """`utt`: (pcm, transcript or None) of the utterance this answers; None for a follow-up of late results."""
+        """`utt`: (pcm, transcript or None, task making it or None) of the utterance this answers; None for a
+        follow-up of late results."""
         if utt is not None:
-            pcm, text = utt
+            pcm, text, pending = utt
+            forced = text is not None
             if text is None and stt.enabled():
-                if stt.HINT:
-                    text = await stt.transcribe(self.http, pcm)  # ~0.3 s, also logged
-                else:
-                    self.spawn(stt.transcribe(self.http, pcm))   # only for the log
-            self.add_user_turn(pcm, text if (text and (stt.HINT or utt[1])) else None)
+                if stt.needs_text():
+                    text = await pending if pending is not None else await stt.transcribe(self.http, pcm)
+                elif pending is None:
+                    self.spawn(stt.transcribe(self.http, pcm))  # only for the log
+            if stt.mode() == "text" and text is not None and not stt.has_words(text):
+                log.info("no words in the transcript, not answered")
+                self.turn_open = False
+                self.touch()
+                if not self.speaking and not self.ending:
+                    self.set_state("listening")
+                return
+            self.add_user_turn(pcm, text, forced)
         q: asyncio.Queue = asyncio.Queue()
         self.tts_task = asyncio.create_task(self.tts_worker(q))
         try:
@@ -347,8 +372,9 @@ class Dialog(Session):
         req = next((json.loads(c["args"] or "{}").get("request", "") for c in calls if c["name"] == "ask_hermes"), "")
         for i in range(len(self.history) - 1, -1, -1):
             m = self.history[i]
-            if m.get("role") == "user" and isinstance(m.get("content"), list):
-                self.history[i] = {"role": "user", "content": "(голосом) " + req if req else "(реплика хозяина)"}
+            if m.get("role") == "user":  # only this turn's own sound (a text turn has none)
+                if isinstance(m.get("content"), list):
+                    self.history[i] = {"role": "user", "content": "(голосом) " + req if req else "(реплика хозяина)"}
                 break
 
     async def llm_events(self, body: dict, headers: dict):

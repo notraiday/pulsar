@@ -64,6 +64,7 @@ class Session:
         self.group = None               # reminders.Group of a dialog the house started (reminder on several stations)
         self.vad_off = False            # another station of the group answers: hear nothing more
         self.http = None                # backends that have one set it (stt.py uses it)
+        self.spec = None                # transcript of the utterance so far, started at its first pause (stt.py)
         self.bg: set = set()            # background tasks of the dialog (cancelled when it ends)
 
     # ---- hooks for backends ----
@@ -80,8 +81,9 @@ class Session:
     async def on_mic(self, pcm: bytes):
         self.feed(pcm)
 
-    def on_utterance(self, pcm: bytes, text: str | None = None):
-        """The turn detector heard the end of an utterance (`text`: its local transcript, when one was needed)."""
+    def on_utterance(self, pcm: bytes, text: str | None = None, pending=None):
+        """The turn detector heard the end of an utterance (`text`: its local transcript when one was already needed,
+        `pending`: a task that is making it)."""
 
     def working(self) -> bool:
         """Background work (tool calls) that keeps the dialog open although nothing plays."""
@@ -240,26 +242,35 @@ class Session:
             self.touch()
             if self.group is not None:
                 self.group.heard(self, db)
+            if self.spec is not None:
+                self.spec.cancel()  # the owner goes on: that transcript is already short of the end
+                self.spec = None
         else:
             self.silence += 1
+            if (self.silence == max(1, stt.SPEC_MS // FRAME_MS) and self.spec is None and self.http is not None
+                    and stt.needs_text()):
+                self.spec = self.spawn(stt.transcribe(self.http, b"".join(self.utt)))
         if self.silence * FRAME_MS >= END_SILENCE_MS or len(self.utt) * FRAME_MS / 1000 > MAX_UTT_S:
             utt, voiced_n = self.utt, self.voiced_in_utt
             self.utt, self.pre, self.flags = None, [], []
+            spec, self.spec = self.spec, None
             pcm = b"".join(utt)
             if voiced_n * FRAME_MS < MIN_SPEECH_MS:
                 if stt.enabled() and self.http is not None and voiced_n * FRAME_MS >= stt.RESCUE_MIN_MS:
-                    self.spawn(self.rescue(pcm, voiced_n * FRAME_MS))  # a short command, or noise?
+                    self.spawn(self.rescue(pcm, voiced_n * FRAME_MS, spec))  # a short command, or noise?
                     return
+                if spec is not None:
+                    spec.cancel()
                 log.info("ignored a short noise (%d ms voiced)", voiced_n * FRAME_MS)
                 self.dump("noise", pcm)
                 return
             log.info("utterance %.1fs (%d ms voiced)", len(pcm) / 32000, voiced_n * FRAME_MS)
             self.dump("utt", pcm)
-            self.on_utterance(pcm)
+            self.on_utterance(pcm, None, spec)
 
-    async def rescue(self, pcm: bytes, voiced_ms: int):
+    async def rescue(self, pcm: bytes, voiced_ms: int, spec=None):
         """Too short for the VAD: the local STT decides whether it was words ("удали их") or noise."""
-        text = await stt.transcribe(self.http, pcm)
+        text = await spec if spec is not None else await stt.transcribe(self.http, pcm)
         if stt.has_words(text) and not self.vad_off and not self.ending:
             log.info("short utterance kept (%d ms voiced): %r", voiced_ms, text)
             self.dump("utt", pcm)

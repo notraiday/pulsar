@@ -1,4 +1,5 @@
-"""The local STT as a second opinion (stt.py): short commands kept, noise dropped, transcripts next to the audio."""
+"""The local STT (stt.py): the transcript as the turn (made ahead, once), next to the audio, or not at all; short
+commands kept, noise dropped, the sound when the STT fails."""
 import asyncio
 import json
 
@@ -12,7 +13,7 @@ from livebridge.backends import pipeline
 from livebridge.routes import Routes
 
 
-def fakes(seen, transcript):
+def fakes(seen, transcript, stt_status=200):
     async def chat(req):
         seen["chat"].append(await req.json())
         ev = {"choices": [{"delta": {"content": "Хорошо."}}]}
@@ -24,6 +25,8 @@ def fakes(seen, transcript):
     async def transcriptions(req):
         form = await req.post()
         seen["stt"].append((req.headers.get("Authorization"), form["model"], len(form["file"].file.read())))
+        if stt_status != 200:
+            return web.Response(status=stt_status, text="boom")
         return web.json_response({"text": transcript})
 
     app = web.Application()
@@ -34,7 +37,7 @@ def fakes(seen, transcript):
     return app
 
 
-def run(tmp_path, monkeypatch, transcript, frames):
+def run(tmp_path, monkeypatch, transcript, frames, stt_status=200):
     seen = {"chat": [], "stt": []}
     monkeypatch.setattr(pipeline, "OR_KEY", "test-key")
     monkeypatch.setattr(agent, "AGENT", "hermes")
@@ -43,7 +46,7 @@ def run(tmp_path, monkeypatch, transcript, frames):
     monkeypatch.setattr(stt, "KEY", "stt-key")
 
     async def go():
-        runner, port = await serve_app(fakes(seen, transcript))
+        runner, port = await serve_app(fakes(seen, transcript, stt_status))
         monkeypatch.setattr(pipeline, "OR_BASE", f"http://127.0.0.1:{port}")
         monkeypatch.setattr(stt, "URL", f"http://127.0.0.1:{port}/stt")
         routes = tmp_path / "routes.json"
@@ -71,9 +74,7 @@ def test_a_short_command_the_vad_would_drop_is_kept(tmp_path, monkeypatch, fake_
     seen, got = run(tmp_path, monkeypatch, "Удалите их.", [LOUDER] * 7 + [QUIET] * 25)   # 224 ms voiced
     assert len(seen["stt"]) == 1 and seen["stt"][0][:2] == ("Bearer stt-key", stt.MODEL)
     assert len(seen["chat"]) == 1
-    content = user_content(seen["chat"][0])
-    assert content[0]["type"] == "text" and "Удалите их." in content[0]["text"]
-    assert content[1]["type"] == "input_audio"
+    assert user_content(seen["chat"][0]) == "Удалите их."
 
 
 def test_short_noise_stays_ignored(tmp_path, monkeypatch, fake_vad):
@@ -82,14 +83,43 @@ def test_short_noise_stays_ignored(tmp_path, monkeypatch, fake_vad):
     assert got[-1] == (b"X", b"idle")
 
 
-def test_every_turn_gets_its_transcript_next_to_the_audio(tmp_path, monkeypatch, fake_vad):
-    seen, got = run(tmp_path, monkeypatch, "Какая погода завтра?", [LOUDER] * 20 + [QUIET] * 25)
+SPEECH = [LOUDER] * 20 + [QUIET] * 25
+
+
+def test_by_default_the_turn_is_its_transcript_made_ahead_once(tmp_path, monkeypatch, fake_vad):
+    seen, got = run(tmp_path, monkeypatch, "Какая погода завтра?", SPEECH)
+    assert len(seen["stt"]) == 1                      # the one started at the pause, not a second one at the end
+    assert user_content(seen["chat"][0]) == "Какая погода завтра?"
+    assert "расшифровкой" in seen["chat"][0]["messages"][0]["content"]   # the persona knows it gets text
+
+
+def test_a_pause_inside_the_utterance_restarts_the_transcript(tmp_path, monkeypatch, fake_vad):
+    seen, got = run(tmp_path, monkeypatch, "Какая погода завтра?",
+                    [LOUDER] * 10 + [QUIET] * 10 + [LOUDER] * 10 + [QUIET] * 25)
+    assert len(seen["chat"]) == 1
+    # the one started at the pause was dropped; the turn is the transcript of the whole utterance (both parts, more
+    # than the ~22 frames the first part and its pause come to)
+    assert seen["stt"][-1][2] > 30 * 1024
+
+
+def test_both_puts_the_transcript_next_to_the_sound(tmp_path, monkeypatch, fake_vad):
+    monkeypatch.setattr(stt, "INPUT", "both")
+    seen, got = run(tmp_path, monkeypatch, "Какая погода завтра?", SPEECH)
     content = user_content(seen["chat"][0])
-    assert [c["type"] for c in content] == ["text", "input_audio"]
-    assert "Какая погода завтра?" in content[0]["text"]
+    assert [c["type"] for c in content] == ["text", "input_audio"] and "Какая погода завтра?" in content[0]["text"]
 
 
-def test_without_a_hint_the_model_gets_the_sound_alone(tmp_path, monkeypatch, fake_vad):
-    monkeypatch.setattr(stt, "HINT", False)
-    seen, got = run(tmp_path, monkeypatch, "Какая погода завтра?", [LOUDER] * 20 + [QUIET] * 25)
+def test_audio_gives_the_model_the_sound_alone(tmp_path, monkeypatch, fake_vad):
+    monkeypatch.setattr(stt, "INPUT", "audio")
+    seen, got = run(tmp_path, monkeypatch, "Какая погода завтра?", SPEECH)
     assert [c["type"] for c in user_content(seen["chat"][0])] == ["input_audio"]
+
+
+def test_when_the_stt_fails_the_turn_is_the_sound(tmp_path, monkeypatch, fake_vad):
+    seen, got = run(tmp_path, monkeypatch, "", SPEECH, stt_status=500)
+    assert [c["type"] for c in user_content(seen["chat"][0])] == ["input_audio"]
+
+
+def test_a_transcript_without_words_is_not_answered(tmp_path, monkeypatch, fake_vad):
+    seen, got = run(tmp_path, monkeypatch, "", SPEECH)
+    assert seen["chat"] == [] and got[-1] == (b"X", b"idle")
