@@ -9,7 +9,7 @@ from aiohttp import web
 
 import bridge
 from conftest import LOUDER, frames_until, serve_app, station
-from livebridge import hermes, session, wire
+from livebridge import agent, session, wire
 from livebridge.backends import gpt_live
 from livebridge.routes import Routes
 
@@ -75,7 +75,8 @@ async def with_bridge(tmp_path, monkeypatch, seen, scenario, reject=False, key="
     lv_runner, lv_port = await serve_app(fake_live(seen, reject))
     hm_runner, hm_port = await serve_app(fake_hermes(seen))
     monkeypatch.setattr(gpt_live, "URL", f"ws://127.0.0.1:{lv_port}/v1/live/sessions")
-    monkeypatch.setattr(hermes, "HERMES_URL", f"http://127.0.0.1:{hm_port}/v1/chat/completions")
+    monkeypatch.setattr(agent, "AGENT", "hermes")
+    monkeypatch.setattr(agent, "HERMES_URL", f"http://127.0.0.1:{hm_port}/v1/chat/completions")
     routes = tmp_path / "routes.json"
     routes.write_text(json.dumps({"default": "gpt-live", "stations": {"kitchen": {
         "backend": "gpt-live", "options": {"voice": "cedar"}}}}))

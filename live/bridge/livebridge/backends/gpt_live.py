@@ -10,11 +10,13 @@ bridge:
   * barge-in: the model streams audio faster than real time and sends no "interrupted" signal, so the station's
     queue is cut by the same Silero VAD the pipeline backend uses (frame F), and the audio the model had already
     produced is dropped until it pauses (DROP_GAP_S) -- the next response;
-  * the home agent: delegation is "client": on session.delegation.created the bridge asks Hermes with what the owner
-    just said (from the input transcripts) and hands the answer back as session.commentary.append.
+  * the home agent: delegation is "client": on session.delegation.created the bridge asks the agent (agent.py:
+    through Home Assistant by default) with what the owner just said (from the input transcripts) and hands the
+    answer back as session.commentary.append.
 The dialog ends when the station or the model closes it, or after the idle time (there is no end_dialog tool).
 
-Options (routes.json): voice, model, instructions (a file).
+Options (routes.json): voice, model, instructions (a file); the agent's: agent, ha_agent_id, ha_device_id,
+ha_satellite_id (agent.py).
 Environment: OPENAI_API_KEY, LIVE_GPT_URL, LIVE_GPT_MODEL, LIVE_GPT_VOICE, LIVE_GPT_PROXY (else LIVE_OR_PROXY),
 LIVE_GPT_HEADERS (JSON, extra connection headers), LIVE_GPT_DROP_GAP_S.
 """
@@ -29,7 +31,7 @@ from pathlib import Path
 
 import aiohttp
 
-from ..hermes import ask_hermes
+from ..agent import Agent
 from ..session import Session
 from ..util import BackendUnavailable, HERE, read_instructions
 from ..wire import Station, frame
@@ -60,6 +62,7 @@ class GptLive(Session):
         super().__init__(station)
         o = options or {}
         self.http = http
+        self.agent = Agent(http, o)
         self.model = o.get("model") or MODEL
         self.voice = o.get("voice") or VOICE
         self.instructions_file = o.get("instructions")
@@ -77,6 +80,7 @@ class GptLive(Session):
     async def open(self):
         if not os.environ.get("OPENAI_API_KEY"):
             raise BackendUnavailable("OPENAI_API_KEY is not set")
+        self.agent.check()
         if self.instructions_file:
             p = Path(self.instructions_file)
             text = (p if p.is_absolute() else HERE / p).read_text(encoding="utf-8")
@@ -103,7 +107,8 @@ class GptLive(Session):
         except Exception as e:
             await self.close()
             raise BackendUnavailable(f"gpt-live: {e!r}") from e
-        log.info("dialog from %s: %s (gpt-live %s, voice %s)", self.st.peer, self.st.hello, self.model, self.voice)
+        log.info("dialog from %s: %s (gpt-live %s, voice %s, agent %s)", self.st.peer, self.st.hello, self.model,
+                 self.voice, self.agent.describe())
 
     async def close(self):
         for t in self.tools.values():
@@ -200,11 +205,11 @@ class GptLive(Session):
 
     async def run_delegation(self, did: str, request: str):
         try:
-            text = await ask_hermes(self.http, request or "(просьба не расслышана)")
+            text = await self.agent.ask(request or "(просьба не расслышана)")
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            log.warning("hermes failed: %r", e)
+            log.warning("agent failed: %r", e)
             text = f"Агент не ответил: {e}"
         self.n += 1
         self.touch()

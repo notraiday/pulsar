@@ -7,6 +7,7 @@ import pytest
 
 import bridge
 from conftest import frames_until, station
+from livebridge import agent
 from livebridge.routes import Routes
 from livebridge.backends import pipeline, gpt_live
 
@@ -67,6 +68,17 @@ def test_a_backend_that_cannot_start_hands_off(tmp_path, monkeypatch):
     assert run_bridge(tmp_path, {"default": "pipeline", "stations": {"*": "gpt-live"}}, scenario) == [
         [(b"R", b"")]] * 2
     assert run_bridge(tmp_path, {"default": "pipeline"}, scenario) == [[(b"R", b"")]] * 2
+
+
+def test_a_dialog_without_a_way_to_the_agent_is_handed_off(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline, "OR_KEY", "test-key")
+    monkeypatch.setattr(agent, "AGENT", "ha")
+    monkeypatch.setattr(agent, "HA_TOKEN", "")
+
+    async def scenario(port):
+        r, w = await station(port)
+        return await frames_until(r, {b"R", b"X"})
+    assert run_bridge(tmp_path, {"default": "pipeline"}, scenario) == [(b"R", b"")]
 
 
 def test_connections_without_a_hello_are_closed(tmp_path):

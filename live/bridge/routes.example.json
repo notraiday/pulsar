@@ -2,6 +2,7 @@
   "default": "pipeline",
   "fallback": "handoff",
   "stations": {
+    "bedroom": {"backend": "pipeline", "options": {"ha_satellite_id": "assist_satellite.bedroom_station"}},
     "kitchen*": {"backend": "gpt-live", "options": {"voice": "marin"}},
     "guest-room": "handoff"
   }

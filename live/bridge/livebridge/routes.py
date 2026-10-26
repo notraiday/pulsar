@@ -10,7 +10,8 @@
     }
 
 "stations" maps fnmatch patterns on the name the station sends in its hello to a backend (a string, or an object with
-"options" for the backend); the first match wins, otherwise "default". "fallback" (default "handoff") takes the dialog
+"options" for the backend; the agent's options - agent, ha_agent_id, ha_device_id, ha_satellite_id - go on to agent.py);
+the first match wins, otherwise "default". "fallback" (default "handoff") takes the dialog
 when the chosen backend cannot start; "none" ends it instead. A file that is missing keeps the built-in defaults, one
 that does not parse keeps the last good version (and logs).
 """

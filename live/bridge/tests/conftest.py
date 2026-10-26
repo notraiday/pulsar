@@ -28,6 +28,32 @@ LOUDER = (b"\xd0\x07\x30\xf8") * 256   # +2000 / -2000
 QUIET = b"\0" * 1024
 
 
+def fake_ha(seen: list, speech: str = "Плюс десять, облачно.", status: int = 200, response_type: str = "query_answer",
+            delay: float = 0.0):
+    """Home Assistant's POST /api/conversation/process: records (Authorization, body), answers like HA does and hands
+    out a conversation id when the request has none."""
+    import itertools
+    ids = itertools.count(1)
+
+    async def process(req):
+        body = await req.json()
+        seen.append((req.headers.get("Authorization"), body))
+        if delay:
+            await asyncio.sleep(delay)
+        if status != 200:
+            return web.Response(status=status, text=f"{status}: Unauthorized")
+        resp = {"response_type": response_type, "language": body.get("language"),
+                "speech": {"plain": {"speech": speech, "extra_data": None}}, "data": {}}
+        if response_type == "error":
+            resp["data"] = {"code": "no_intent_match"}
+        return web.json_response({"response": resp, "conversation_id": body.get("conversation_id") or f"conv{next(ids)}",
+                                  "continue_conversation": False})
+
+    app = web.Application()
+    app.router.add_post("/api/conversation/process", process)
+    return app
+
+
 async def serve_app(app: web.Application) -> tuple[web.AppRunner, int]:
     runner = web.AppRunner(app)
     await runner.setup()

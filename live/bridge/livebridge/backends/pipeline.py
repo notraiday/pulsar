@@ -1,5 +1,5 @@
 """Pipeline backend: OpenRouter (the chat model hears the speech, its reply is cut into sentences and spoken by a
-TTS model) with the home agent behind the ask_hermes tool.
+TTS model) with the home agent behind the ask_hermes tool (through Home Assistant by default, see agent.py).
 
 The VAD in Session does the turn-taking: it finds the end of an utterance, which goes to the chat model as audio;
 the reply text is cut into sentences and each sentence is synthesised and streamed to the station while the model
@@ -7,7 +7,8 @@ keeps writing. Speech over the answer cancels all of it (barge-in); tool calls k
 their results are spoken later. The dialog ends when the model calls end_dialog, after IDLE_S of silence once the
 answer has played, or when the station ends it.
 
-Options (routes.json): llm, tts_voice, instructions (a file).
+Options (routes.json): llm, tts_voice, instructions (a file); the agent's: agent, ha_agent_id, ha_device_id,
+ha_satellite_id (agent.py).
 """
 import asyncio
 import base64
@@ -20,7 +21,7 @@ from pathlib import Path
 
 import aiohttp
 
-from ..hermes import ask_hermes
+from ..agent import Agent
 from ..session import Session
 from ..util import BackendUnavailable, HERE, clean_for_speech, read_instructions, wav16k
 from ..wire import Station, frame
@@ -89,6 +90,7 @@ class Dialog(Session):
         super().__init__(station)
         o = options or {}
         self.http = http
+        self.agent = Agent(http, o)
         self.llm = o.get("llm") or LLM
         self.voice = o.get("tts_voice") or TTS_VOICE
         self.instructions_file = o.get("instructions")
@@ -107,12 +109,14 @@ class Dialog(Session):
     async def open(self):
         if not OR_KEY:
             raise BackendUnavailable("OPENROUTER_API_KEY is not set")
+        self.agent.check()
         if self.instructions_file:
             p = Path(self.instructions_file)
             self.instructions = (p if p.is_absolute() else HERE / p).read_text(encoding="utf-8")
         else:
             self.instructions = read_instructions()
-        log.info("dialog from %s: %s (llm %s, tts %s/%s)", self.st.peer, self.st.hello, self.llm, TTS, self.voice)
+        log.info("dialog from %s: %s (llm %s, tts %s/%s, agent %s)", self.st.peer, self.st.hello, self.llm, TTS,
+                 self.voice, self.agent.describe())
         self._warm = asyncio.create_task(self.prewarm())
 
     async def prewarm(self):
@@ -250,7 +254,7 @@ class Dialog(Session):
                     self.tools.pop(c["id"], None)
                 direct = self.direct_answer(calls, results)
                 if direct:
-                    log.info("direct answer from hermes (%d chars), no second model round", len(direct))
+                    log.info("direct answer from the agent (%d chars), no second model round", len(direct))
                     self.history.append({"role": "assistant", "content": direct})
                     await self.flush_sentences(direct, q, final=True)
                     break
@@ -469,11 +473,11 @@ class Dialog(Session):
             if not self.speaking:
                 self.set_state("thinking")
             try:
-                return await ask_hermes(self.http, str(args.get("request", "")))
+                return await self.agent.ask(str(args.get("request", "")))
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                log.warning("hermes failed: %r", e)
+                log.warning("agent failed: %r", e)
                 return f"Агент не ответил: {e}"[:300]
         return f"unknown tool {c['name']}"
 

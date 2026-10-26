@@ -4,11 +4,12 @@ import json
 import time
 
 import aiohttp
+import pytest
 from aiohttp import web
 
 import bridge
-from conftest import LOUDER, QUIET, frames_until, serve_app, station
-from livebridge import hermes, session, wire
+from conftest import LOUDER, QUIET, fake_ha, frames_until, serve_app, station
+from livebridge import agent, session, wire
 from livebridge.backends import pipeline
 from livebridge.routes import Routes
 
@@ -149,18 +150,23 @@ def fake_hermes(seen):
     return app
 
 
-def test_a_spoken_question_goes_through_the_agent_and_is_answered_aloud(tmp_path, monkeypatch, fake_vad):
-    seen = {"chat": [], "tts": [], "hermes": []}
+@pytest.mark.parametrize("way", ["ha", "hermes"])
+def test_a_spoken_question_goes_through_the_agent_and_is_answered_aloud(tmp_path, monkeypatch, fake_vad, way):
+    seen = {"chat": [], "tts": [], "hermes": [], "ha": []}
     monkeypatch.setattr(session, "IDLE_S", 0.4)
     monkeypatch.setattr(pipeline, "OR_KEY", "test-key")
+    monkeypatch.setattr(agent, "AGENT", way)
 
     async def go():
         or_runner, or_port = await serve_app(fake_openrouter(seen))
-        hm_runner, hm_port = await serve_app(fake_hermes(seen))
+        hm_runner, hm_port = await serve_app(fake_ha(seen["ha"]) if way == "ha" else fake_hermes(seen))
         monkeypatch.setattr(pipeline, "OR_BASE", f"http://127.0.0.1:{or_port}")
-        monkeypatch.setattr(hermes, "HERMES_URL", f"http://127.0.0.1:{hm_port}/v1/chat/completions")
+        monkeypatch.setattr(agent, "HERMES_URL", f"http://127.0.0.1:{hm_port}/v1/chat/completions")
+        monkeypatch.setattr(agent, "HA_URL", f"http://127.0.0.1:{hm_port}")
+        monkeypatch.setattr(agent, "HA_TOKEN", "ha-token")
         routes = tmp_path / "routes.json"
-        routes.write_text(json.dumps({"default": "pipeline"}))
+        routes.write_text(json.dumps({"default": "pipeline", "stations": {"kitchen": {
+            "backend": "pipeline", "options": {"ha_satellite_id": "assist_satellite.kitchen"}}}}))
         async with aiohttp.ClientSession() as http:
             server = await bridge.serve("127.0.0.1:0", Routes(routes), http)
             port = server.sockets[0].getsockname()[1]
@@ -181,8 +187,14 @@ def test_a_spoken_question_goes_through_the_agent_and_is_answered_aloud(tmp_path
     states = [p.decode() for t, p in got if t == b"S"]
     assert states[:3] == ["listening", "thinking", "speaking"]
     assert b"A" in types and got[-1] == (b"X", b"idle")
-    # the agent got the request with the router mark; its short answer was spoken as it was, in one model round
-    assert seen["hermes"] == ["@@LIVE@@ какая погода"]
+    # the agent got the request with the router mark (through HA: as the station's satellite); its short answer was
+    # spoken as it was, in one model round
+    if way == "ha":
+        assert [(b["text"], b.get("satellite_id")) for _, b in seen["ha"]] == [
+            ("@@LIVE@@ какая погода", "assist_satellite.kitchen")]
+        assert seen["hermes"] == []
+    else:
+        assert seen["hermes"] == ["@@LIVE@@ какая погода"] and seen["ha"] == []
     assert seen["tts"] == ["Плюс десять, облачно."]
     assert len(seen["chat"]) == 1
     # the question went to the model as audio
