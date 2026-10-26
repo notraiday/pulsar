@@ -1,0 +1,8 @@
+{
+  "default": "pipeline",
+  "fallback": "handoff",
+  "stations": {
+    "kitchen*": {"backend": "gpt-live", "options": {"voice": "marin"}},
+    "guest-room": "handoff"
+  }
+}

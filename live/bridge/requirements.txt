@@ -1,0 +1,3 @@
+aiohttp
+pysilero-vad
+audioop-lts; python_version >= "3.13"

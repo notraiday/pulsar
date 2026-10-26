@@ -35,6 +35,8 @@ UDP broadcast (port 6054) so that only the one that heard it loudest answers.
 | `satellite/crates/pulsar-hw/` | LED ring / logo (framebuffers behind ledfb triggers, or sysfs brightness without one; `leds.rs`: output, case matrix, layer compositor, fades), pure rendering of voice states / one-shots / effects / music styles (`led_fx.rs`), input (touch keys, `SW_MUTE_DEVICE` or a polled sysfs GPIO (`Model::mute_gpio`); `input.rs`); bin `hw_probe` |
 | `satellite/crates/pulsar-clock/` | clock (sysfs segments, per-LED brightness; `clock.rs`: layers), pure rendering of the clock's stock animations and music levels (`clock_fx.rs`), font, light sensor (`ltr308als01`, `light_sensor.rs`) |
 | `satellite/crates/pulsar-zigbee/` | Midi Zigbee radio: zbhci link to the Telink chip (`link.rs`), coordinator on pulsar's firmware + ZDO to the coordinator itself (`coordinator.rs`), deCONZ-protocol TCP server for Zigbee2MQTT / ZHA (`deconz.rs`), router control (`router.rs`), `.ybl` parsing + XMODEM upload through the radio's bootloader (`flasher.rs`), role / firmware orchestration (`service.rs`), role table (`roles.rs`), byte order helpers (`bytes.rs`); bin `zigbee_probe [port] \| info \| flash <image>` (coordinator + deCONZ server on another port without the daemon; firmware identification; writing an image) |
+| `satellite/crates/pulsar-live/` | Live (duplex) dialogs through a bridge over TCP: wire format (`wire.rs`: frames `H A D E` up, `A F S X R` down), session task (`session.rs`: connect with a 3 s timeout, mic streaming with a 1.5 s tail for hand-offs, 3 s kept when the bridge cannot be reached), own ALSA answer playback on `Model::playback_pcm` (`playback.rs`: 24 kHz mono, drain detection, flush, mute gain) on the `live-play` thread; the controller side is `controller/live.rs`; docs `docs/live.md` |
+| `live/bridge/` | the bridge service (Python 3.12, aiohttp, Silero VAD): `bridge.py` (server, routing), `livebridge/` (`wire.py`, `session.py` = station I/O + turn detection, `routes.py` = hot-reloaded `routes.json`, `hermes.py`), `livebridge/backends/` (`pipeline` OpenRouter, `gpt_live` experimental OpenAI GPT-Live, `handoff`, `selftest`; a new file there is a new backend), `tests/` (pytest, no keys), `tools/` (manual checks), `Dockerfile`; `*.example.*` are the only config files in the repo, keys come from the environment and never go into it |
 | `satellite/crates/pulsar-update/` | HA "Firmware" update entity backend: HTTPS with rustls + ring (`https.rs`), GitHub release check / download / verify / swap (`updater.rs`), version comparison (`version.rs`); bin `update_probe` |
 | `satellite/crates/*/src/bin/` | tools (`make ARCH=<arch> tools`): `alsa_abi_probe` (ALSA hw-params ABI on the `null` PCM, no sound), `api_selftest` (API server with printing handlers, `[port=16053] [name] [run_seconds=120] [key_file]`), `lan_probe` (mDNS / arbiter probes on alternative ports), `ww_offline` (offline spotter test on a raw capture WAV), `frontend_probe` (microphone front-end without the daemon: events, rates, `--record` of the raw capture), `player_probe` (music / announce / http / 404 / https scenario at volume ≤ 0.2, original raw restored), `sendspin_probe` (Sendspin player without the daemon on another port, Master volume capped at 0.2, for `tools/sendspin_server.py`), `hw_probe` (LEDs, clock, input, light sensor), `update_probe` (HTTPS client, release check, install into a scratch dir), `zigbee_probe` |
 | `satellite/deploy/` | `dist.sh` (release archives, host side); `boot.sh`, `supervise.sh`, `ctl.sh` (device side) |
@@ -447,6 +449,17 @@ colours, clock layout, playback, keys.
   libc calls live only in `sys.rs` / `ffi.rs` / `gst.rs` and the crash handler. Details, the
   sendspin-cpp link recipe and per-service notes: `docs/architecture.md`.
 - Keep the ESPHome API server pending until a valid `HelloRequest`; probes must not displace HA.
+- Live dialogs (`docs/live.md`): the station is a thin client, the bridge decides everything else
+  (which model, when an utterance ends, hand-off). `live_bridge` file in the state directory
+  (`host:port` or `off`, read at every dialog, `ctl.sh live-bridge`) wins over the `live_bridge=`
+  key of `state.conf`; with neither, nothing Live runs and Home Assistant answers. The key is
+  written (with `voice_mode=Live`, read by the old C++ Live build) only when non-empty, so golden
+  `state.conf` output is unchanged otherwise. An unreachable bridge, a failed audio output or the
+  bridge's `R` frame start the HA pipeline with the microphone audio not yet sent. While a dialog is
+  open: music ducked, mic streaming, wake word only flushes playback, button / stop word / mic mute
+  end it, volume words work, 15 min limit, `assist_satellite.start_conversation` is refused.
+  The bridge never receives or sends anything that is not in the wire format of
+  `pulsar-live/src/wire.rs`; keep the Python side (`live/bridge/livebridge/wire.py`) in step.
 - State persisted in `state.conf` (key=value); add new keys with safe defaults. The binary kept as
   `.prev` (possibly an older build) reads the same file after a rollback, so existing keys keep
   their format (`pulsar_core::fmt`: `%g` numbers, `strtof` parsing, C locale). Writes

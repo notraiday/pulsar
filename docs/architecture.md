@@ -24,6 +24,7 @@ satellite/
     pulsar-hw/            # leds, led_fx, input (bin hw_probe)
     pulsar-clock/         # clock, clock_fx, light_sensor
     pulsar-zigbee/        # link, coordinator, deconz, router, flasher, service (bin zigbee_probe)
+    pulsar-live/          # wire, session (TCP-клиент моста), playback (ALSA-вывод ответа)
     pulsar-update/        # https, updater (bin update_probe)
   third_party/            # fetch.sh, CMakeLists.txt, toolchain/ (только для sendspin-cpp)
 ```
@@ -331,6 +332,31 @@ println!("cargo:rustc-link-lib=c++");
   перезапуск потока сервером (seek / skip) не дёргает состояние медиаплеера в HA и музыкальные
   дисплеи. `stopped` завершает удерживаемый конец сразу.
 - `yield_to_local()` только шлёт `client/leave`, `streaming` синхронно не меняет.
+
+### `pulsar-live`
+
+Поведение для пользователя описано в `docs/live.md`; здесь — устройство крейта.
+
+- `spawn(pcm)` отдаёт `LiveHandle` и приёмник `LiveEvent`. Сессия одна; `start` возвращает её id,
+  каждое событие несёт id, контроллер игнорирует события сессии, которую оставил. `Ended`
+  приходит ровно один раз за сессию, кроме `teardown()` и сессии, заменённой новым `start()`
+  (владелец её сам бросил). Колбэк простоя воспроизведения держит `Weak` на отправитель, чтобы не
+  удерживать канал событий после `teardown`.
+- Сессия — задача на потоке рантайма: подключение (`CONNECT_TIMEOUT` 3 с, DNS через
+  `lookup_host`, `TCP_NODELAY`, keepalive), цикл `select!` из чтения (`wire::Decoder`), команд
+  (пакет до 64 за раз) и записи (лимит 4 МиБ ожидающих байт). Пока соединение не открыто, звук
+  микрофона копится (`KEEP_SAMPLES`, 3 с): при `ConnectFailed` он возвращается в `End::unsent` для
+  конвейера HA. Последние 1,5 с микрофона (`Tail`) нужны для кадра `R`.
+- Воспроизведение: поток `live-play` сам открывает устройство (`Model::playback_pcm`, S16LE моно
+  24 кГц, период 20 мс, буфер 125 мс, порог старта один кадр), поэтому его ошибка приходит до того,
+  как диалог начался (`ready`). Устройство открыто только пока идёт диалог (softvol + dmix:
+  громкость общая, звук смешивается с музыкой и звуками). Конец очереди определяется по `delay()`
+  ALSA; пауза длиннее буфера в 125 мс даёт underrun, поток перезапускается на следующей записи.
+  `flush` очищает очередь и сбрасывает устройство, `set_gain` — Q8-множитель (mute), очередь
+  ограничена 90 с. `unsafe` в крейте запрещён
+  (`#![deny(unsafe_code)]`): ALSA только через `pulsar-alsa`, `Drop` ставит флаг остановки и не
+  ждёт поток.
+- Тесты: сессия — на loopback-TCP с поддельным устройством (`playback::fake`), без сети и железа.
 
 ### `pulsar-hw` и `pulsar-clock`
 

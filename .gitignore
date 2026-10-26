@@ -19,3 +19,6 @@
 
 # Test recordings / synthesized speech.
 *.wav
+__pycache__/
+.pytest_cache/
+.venv/

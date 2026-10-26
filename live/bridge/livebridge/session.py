@@ -1,0 +1,253 @@
+"""What every dialog backend that listens through the station's mic needs: the station side of the dialog and a
+voice-activity turn detector (Silero VAD on the echo-cancelled 16 kHz mic stream).
+
+A backend subclasses Session and fills in the hooks (open, on_utterance, cancel_response, ...). The base does the
+reading of station frames, the VAD (utterance starts / ends, barge-in over a playing or pending answer, noise
+rejection), the idle watchdog and the end of the dialog.
+"""
+import asyncio
+import audioop
+import logging
+import math
+import os
+import time
+from pathlib import Path
+
+from pysilero_vad import SileroVoiceActivityDetector
+
+from .util import wav16k
+from .wire import Station, frame
+
+log = logging.getLogger("live")
+
+IDLE_S = float(os.environ.get("LIVE_IDLE_S", "8"))
+FIRST_IDLE_S = float(os.environ.get("LIVE_FIRST_IDLE_S", "10"))  # nothing said after the wake word
+# Silero VAD (neural, tells speech from keyboard clicks / room noise) on 32 ms frames
+VAD_ON = float(os.environ.get("LIVE_VAD_ON", "0.5"))     # speech probability that makes a frame "voiced" outside an utterance
+VAD_OFF = float(os.environ.get("LIVE_VAD_OFF", "0.35"))  # ... and inside one (hysteresis, bridges short pauses)
+VOICED_RATIO = float(os.environ.get("LIVE_VOICED_RATIO", "0.75"))  # share of voiced frames in the start/barge window
+END_SILENCE_MS = int(os.environ.get("LIVE_END_SILENCE_MS", "600"))
+START_MS = int(os.environ.get("LIVE_START_MS", "192"))
+BARGE_MS = int(os.environ.get("LIVE_BARGE_MS", "480"))   # speech needed to cut an answer that is playing or being made
+MIN_SPEECH_MS = int(os.environ.get("LIVE_MIN_SPEECH_MS", "320"))
+MAX_UTT_S = float(os.environ.get("LIVE_MAX_UTT_S", "25"))
+FRAME_MS = 32
+LEAD_FRAMES = 4  # audio kept before the detection window when an utterance starts
+DUMP_DIR = os.environ.get("LIVE_DUMP_DIR") or None  # debug: wav of every utterance / barge-in, last DUMP_KEEP files
+DUMP_KEEP = int(os.environ.get("LIVE_DUMP_KEEP", "80"))
+
+
+class Session:
+    FRAME = 1024  # bytes: 32 ms of s16le at 16 kHz, what Silero wants
+
+    def __init__(self, station: Station):
+        self.st = station
+        self.state = ""
+        self.speaking = False      # audio sent and not yet reported played
+        self.turn_open = False     # a reply is being produced
+        self.last_activity = time.monotonic()
+        self.heard_user = False
+        self.ending = None         # reason, once the dialog should end after playback
+        self.vad = SileroVoiceActivityDetector()
+        self.buf = b""
+        self.flags = []   # per frame: voiced?
+        self.probs = []   # per frame: Silero speech probability
+        self.dbs = []     # per frame: mic level, dBFS
+        self.ring = []    # last ~3 s of mic frames, for dumps
+        self.pre = []
+        self.utt = None
+        self.voiced_in_utt = 0
+        self.silence = 0
+        self.echo = [0, 0.0, 0.0, 0]    # frames, sum dBFS, max VAD p, frames over VAD_ON: mic while the station plays
+        self.quiet = [0, 0.0]           # frames, sum dBFS: mic while nothing plays and nobody talks
+
+    # ---- hooks for backends ----
+    async def open(self):
+        """Connect to whatever makes the answers. Raise BackendUnavailable (before sending anything) to hand off."""
+
+    async def close(self):
+        """Release what open() acquired."""
+
+    def tasks(self) -> list:
+        """Extra coroutines that run for the whole dialog; the dialog ends when any of them returns."""
+        return []
+
+    async def on_mic(self, pcm: bytes):
+        self.feed(pcm)
+
+    def on_utterance(self, pcm: bytes):
+        """The turn detector heard the end of an utterance."""
+
+    def working(self) -> bool:
+        """Background work (tool calls) that keeps the dialog open although nothing plays."""
+        return False
+
+    def followup_due(self) -> bool:
+        return False
+
+    def start_followup(self):
+        pass
+
+    def cancel_response(self, flush: bool):
+        """The owner spoke over the answer (flush: the station is to drop what it has queued)."""
+        if flush:
+            self.send(frame(b"F"))
+        self.speaking = False
+        self.turn_open = False
+
+    # ---- station I/O ----
+    def send(self, data: bytes):
+        self.st.send(data)
+
+    def set_state(self, s: str):
+        if s != self.state:
+            self.state = s
+            self.send(frame(b"S", s.encode()))
+
+    def touch(self):
+        self.last_activity = time.monotonic()
+
+    async def run(self):
+        await self.open()
+        self.set_state("listening")
+        tasks = [asyncio.create_task(c) for c in (self.uplink(), self.watchdog(), *self.tasks())]
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for t in tasks:
+            t.cancel()
+            if t.done() and not t.cancelled() and t.exception():
+                log.warning("dialog task failed: %r", t.exception())
+                self.ending = self.ending or "error"
+        self.cancel_response(flush=False)
+        await self.close()
+        await self.st.finish(b"X", self.ending or "closed")
+        log.info("dialog from %s ended: %s", self.st.peer, self.ending)
+
+    async def uplink(self):
+        while True:
+            f = await self.st.read()
+            if f is None:
+                self.ending = self.ending or "station disconnected"
+                return
+            t, p = f
+            if t == b"A":
+                await self.on_mic(p)
+            elif t == b"D":
+                self.speaking = False
+                self.touch()
+                if not self.turn_open:
+                    if self.ending:
+                        return
+                    self.set_state("listening")
+            elif t == b"E":
+                self.ending = "station: " + p.decode(errors="replace")
+                return
+
+    async def watchdog(self):
+        while True:
+            await asyncio.sleep(0.25)
+            busy = self.speaking or self.turn_open or self.utt is not None or self.working()
+            if self.ending and not busy:
+                return
+            if not self.turn_open and self.utt is None and not self.ending and not self.st.closing \
+                    and self.followup_due():
+                self.start_followup()
+                continue
+            if busy:
+                continue
+            if time.monotonic() - self.last_activity > (IDLE_S if self.heard_user else FIRST_IDLE_S):
+                self.ending = "idle"
+                return
+
+    # ---- voice activity ----
+    def feed(self, pcm: bytes):
+        self.buf += pcm
+        while len(self.buf) >= self.FRAME:
+            fr, self.buf = self.buf[:self.FRAME], self.buf[self.FRAME:]
+            self.on_frame(fr, self.vad.process_chunk(fr))
+
+    def on_frame(self, fr: bytes, p: float):
+        voiced = p >= (VAD_OFF if self.utt is not None else VAD_ON)
+        db = 20 * math.log10(max(audioop.rms(fr, 2), 1) / 32768)
+        for seq, v, n in ((self.flags, voiced, 94), (self.probs, p, 94), (self.dbs, db, 94), (self.ring, fr, 94)):
+            seq.append(v)
+            del seq[:-n]
+        if self.utt is None:
+            if self.speaking:
+                e = self.echo
+                e[0] += 1
+                e[1] += db
+                e[2] = max(e[2], p)
+                e[3] += p >= VAD_ON
+            else:
+                if self.echo[0]:
+                    self.report_echo()
+                if not self.turn_open:
+                    self.quiet[0] += 1
+                    self.quiet[1] += db
+            self.pre.append(fr)
+            del self.pre[:-(BARGE_MS // FRAME_MS + 8)]
+            busy = self.speaking or self.turn_open
+            need = (BARGE_MS if busy else START_MS) // FRAME_MS
+            recent = self.flags[-need:]
+            if len(recent) == need and sum(recent) >= math.ceil(need * VOICED_RATIO):
+                if busy:
+                    log.info("barge-in by voice (%s, p %.2f, %.0f dBFS)", "speaking" if self.speaking else "thinking",
+                             sum(self.probs[-need:]) / need, sum(self.dbs[-need:]) / need)
+                    self.dump("barge-" + ("speaking" if self.speaking else "thinking"), b"".join(self.ring),
+                              self.probs, self.dbs)
+                    self.echo = [0, 0.0, 0.0, 0]    # the last frames were the owner, not echo
+                    self.cancel_response(flush=True)
+                self.utt = self.pre[-(need + LEAD_FRAMES):]
+                self.voiced_in_utt = sum(recent)
+                self.silence = 0
+                self.heard_user = True
+                self.touch()
+                self.set_state("listening")
+            return
+        self.utt.append(fr)
+        if voiced:
+            self.voiced_in_utt += 1
+            self.silence = 0
+            self.touch()
+        else:
+            self.silence += 1
+        if self.silence * FRAME_MS >= END_SILENCE_MS or len(self.utt) * FRAME_MS / 1000 > MAX_UTT_S:
+            utt, voiced_n = self.utt, self.voiced_in_utt
+            self.utt, self.pre, self.flags = None, [], []
+            pcm = b"".join(utt)
+            if voiced_n * FRAME_MS < MIN_SPEECH_MS:
+                log.info("ignored a short noise (%d ms voiced)", voiced_n * FRAME_MS)
+                self.dump("noise", pcm)
+                return
+            log.info("utterance %.1fs (%d ms voiced)", len(pcm) / 32000, voiced_n * FRAME_MS)
+            self.dump("utt", pcm)
+            self.on_utterance(pcm)
+
+    def report_echo(self):
+        """What the station's echo canceller leaves of our own voice in the mic stream (it feeds us the cleaned signal)."""
+        n, sdb, pmax, over = self.echo
+        self.echo = [0, 0.0, 0.0, 0]
+        if n < 15:
+            return
+        q = self.quiet
+        floor = f"{q[1] / q[0]:.0f}" if q[0] > 20 else "n/a"
+        log.info("echo check: %.1fs of our own audio, mic mean %.0f dBFS (room floor %s), max VAD p %.2f, %d frames over the threshold",
+                 n * FRAME_MS / 1000, sdb / n, floor, pmax, over)
+
+    def dump(self, kind: str, pcm: bytes, probs=None, dbs=None):
+        """Debug aid (LIVE_DUMP_DIR): keep the sound that made a decision, so it can be listened to and re-run."""
+        if not DUMP_DIR:
+            return
+        try:
+            d = Path(DUMP_DIR)
+            d.mkdir(parents=True, exist_ok=True)
+            name = f"{time.strftime('%H%M%S')}-{kind}"
+            (d / f"{name}.wav").write_bytes(wav16k(pcm))
+            if probs is not None:
+                (d / f"{name}.txt").write_text("\n".join(f"{p:.2f} {b:.0f}" for p, b in zip(probs, dbs)) + "\n")
+            old = sorted(d.glob("*.wav"), key=lambda f: f.stat().st_mtime)[:-DUMP_KEEP]
+            for f in old:
+                f.unlink(missing_ok=True)
+                f.with_suffix(".txt").unlink(missing_ok=True)
+        except OSError as e:
+            log.warning("dump failed: %r", e)

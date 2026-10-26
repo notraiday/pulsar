@@ -1,5 +1,5 @@
 #!/bin/sh
-# pulsar control: enable | disable | restart | reload | status | log | api-key
+# pulsar control: enable | disable | restart | reload | status | log | api-key | live-bridge
 #   enable  - stop the Yandex stack, run pulsar now and on every boot
 #   disable - stop pulsar, start the Yandex stack again (also after reboot)
 #   reload  - restart the supervisor and the daemon (after supervise.sh was replaced); never starts
@@ -9,6 +9,10 @@
 #             recent Home Assistant (mid-2026+) provisions a key automatically over the API on first
 #             connect; setting or clearing a different key by hand makes HA ask to re-authenticate.
 #             A corrupt file makes the daemon fail closed, hence the validation below.
+#   live-bridge [host:port|off|clear] - Live dialogs ($D/live_bridge, read at every dialog, no restart):
+#             no argument shows it; host:port sends wake-word dialogs to that bridge; off keeps Home
+#             Assistant answering whatever state.conf says; clear removes the file (state.conf's
+#             live_bridge= applies again, else Home Assistant answers).
 D=${PULSAR_DIR:-/data/pulsar}
 Q=${PULSAR_Q:-/system/vendor/quasar/q}
 
@@ -144,8 +148,33 @@ case "$1" in
         ;;
     esac
     ;;
+  live-bridge)
+    f=$D/live_bridge
+    case "${2-}" in
+      "")
+        if [ -s "$f" ]; then echo "live bridge: $(head -n 1 "$f")"; else echo "live bridge: no file (state.conf or Home Assistant)"; fi
+        ;;
+      clear)
+        rm -f "$f"
+        echo "live bridge file removed"
+        ;;
+      off)
+        printf 'off\n' > "$f.tmp" && mv "$f.tmp" "$f" && echo "Live off, Home Assistant answers" \
+          || { rm -f "$f.tmp"; echo "cannot write $f" >&2; exit 1; }
+        ;;
+      *)
+        case "$2" in
+          *[!A-Za-z0-9.:_-]* | *:*:* | :* | *: | "") echo "expected host:port, nothing changed" >&2; exit 1 ;;
+          *:*) ;;
+          *) echo "expected host:port, nothing changed" >&2; exit 1 ;;
+        esac
+        printf '%s\n' "$2" > "$f.tmp" && mv "$f.tmp" "$f" && echo "live bridge: $2" \
+          || { rm -f "$f.tmp"; echo "cannot write $f" >&2; exit 1; }
+        ;;
+    esac
+    ;;
   *)
-    echo "usage: $0 enable|disable|restart|reload|status|log [lines]|api-key [base64|clear]"
+    echo "usage: $0 enable|disable|restart|reload|status|log [lines]|api-key [base64|clear]|live-bridge [host:port|off|clear]"
     exit 1
     ;;
 esac
