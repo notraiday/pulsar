@@ -1,12 +1,13 @@
 """The home agent: what a dialog model calls for anything that touches the real world (the pipeline's ask_hermes
 tool, gpt-live's delegation). Two ways to reach it (LIVE_AGENT, or the "agent" option of a route):
 
-  ha      (default) Home Assistant's conversation API, POST /api/conversation/process, with the conversation agent of
+  hermes  (default) the agent's own OpenAI-compatible endpoint (HERMES_URL), past Home Assistant: the agent reaches
+          the house itself (e.g. through Home Assistant's MCP server).
+  ha      Home Assistant's conversation API, POST /api/conversation/process, with the conversation agent of
           the voice pipeline (HA_AGENT_ID, e.g. conversation.extended_openai_conversation in front of Hermes). HA stays
           the one door to the agent: the request lands in HA's chat log, the agent learns which station asked (the
           route options ha_device_id / ha_satellite_id: area context), and changing the agent in HA changes it for
           Live dialogs too. One Live dialog is one HA conversation (its conversation_id is kept between requests).
-  hermes  the agent's own OpenAI-compatible endpoint (HERMES_URL), past Home Assistant.
 
 There is no fallback from one to the other: a request the chosen way cannot answer is reported to the model as failed.
 Either way the request carries HERMES_MARK, the prefix a model router in front of the agent recognises Live requests by.
@@ -22,7 +23,7 @@ from .util import TAG_RE, BackendUnavailable
 
 log = logging.getLogger("live")
 
-AGENT = os.environ.get("LIVE_AGENT", "ha")
+AGENT = os.environ.get("LIVE_AGENT", "hermes")
 TIMEOUT = float(os.environ.get("LIVE_AGENT_TIMEOUT") or os.environ.get("HERMES_TIMEOUT") or "120")
 # Prefix that tells a router in front of the agent: this is a live voice request (cloud model, fast path). "" = none.
 MARK = os.environ.get("HERMES_MARK", "@@LIVE@@")
