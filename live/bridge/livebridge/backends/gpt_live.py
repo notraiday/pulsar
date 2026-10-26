@@ -80,6 +80,9 @@ class GptLive(Session):
     async def open(self):
         if not os.environ.get("OPENAI_API_KEY"):
             raise BackendUnavailable("OPENAI_API_KEY is not set")
+        if self.st.hello.get("reminder"):
+            # The station announces it itself then (hand-off): this backend has no way to open with a given text.
+            raise BackendUnavailable("gpt-live does not open dialogs with a reminder")
         self.agent.check()
         if self.instructions_file:
             p = Path(self.instructions_file)

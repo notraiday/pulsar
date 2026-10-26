@@ -60,6 +60,8 @@ class Session:
         self.silence = 0
         self.echo = [0, 0.0, 0.0, 0]    # frames, sum dBFS, max VAD p, frames over VAD_ON: mic while the station plays
         self.quiet = [0, 0.0]           # frames, sum dBFS: mic while nothing plays and nobody talks
+        self.group = None               # reminders.Group of a dialog the house started (reminder on several stations)
+        self.vad_off = False            # another station of the group answers: hear nothing more
 
     # ---- hooks for backends ----
     async def open(self):
@@ -95,6 +97,13 @@ class Session:
         self.speaking = False
         self.turn_open = False
 
+    def lose(self, reason: str):
+        """Another station of this reminder's group answers the owner: this dialog ends now."""
+        self.vad_off = True
+        self.utt, self.pre, self.flags = None, [], []
+        self.ending = reason
+        self.cancel_response(flush=True)
+
     # ---- station I/O ----
     def send(self, data: bytes):
         self.st.send(data)
@@ -118,6 +127,8 @@ class Session:
                 log.warning("dialog task failed: %r", t.exception())
                 self.ending = self.ending or "error"
         self.cancel_response(flush=False)
+        if self.group is not None:
+            self.group.leave(self)
         await self.close()
         await self.st.finish(b"X", self.ending or "closed")
         log.info("dialog from %s ended: %s", self.st.peer, self.ending)
@@ -134,6 +145,8 @@ class Session:
             elif t == b"D":
                 self.speaking = False
                 self.touch()
+                if self.group is not None:
+                    self.group.drained()
                 if not self.turn_open:
                     if self.ending:
                         return
@@ -186,6 +199,9 @@ class Session:
                     self.quiet[1] += db
             self.pre.append(fr)
             del self.pre[:-(BARGE_MS // FRAME_MS + 8)]
+            if self.vad_off or (self.group is not None and self.group.holding()):
+                self.flags.clear()  # several stations are saying the reminder: this mic hears the others too
+                return
             busy = self.speaking or self.turn_open
             need = (BARGE_MS if busy else START_MS) // FRAME_MS
             recent = self.flags[-need:]
@@ -199,6 +215,8 @@ class Session:
                     self.cancel_response(flush=True)
                 self.utt = self.pre[-(need + LEAD_FRAMES):]
                 self.voiced_in_utt = sum(recent)
+                if self.group is not None:
+                    self.group.claim(self, [d for d, v in zip(self.dbs[-need:], recent) if v])
                 self.silence = 0
                 self.heard_user = True
                 self.touch()
@@ -209,6 +227,8 @@ class Session:
             self.voiced_in_utt += 1
             self.silence = 0
             self.touch()
+            if self.group is not None:
+                self.group.heard(self, db)
         else:
             self.silence += 1
         if self.silence * FRAME_MS >= END_SILENCE_MS or len(self.utt) * FRAME_MS / 1000 > MAX_UTT_S:

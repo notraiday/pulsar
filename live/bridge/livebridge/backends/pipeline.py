@@ -8,6 +8,9 @@ their results are spoken later. The dialog ends when the model calls end_dialog 
 only what it said alongside is played out), after IDLE_S of silence once the
 answer has played, or when the station ends it.
 
+A dialog the house starts (the hello carries "reminder": a station turned HA's start_conversation into it) opens with
+that text spoken on every station that got it, and only the one that hears the owner loudest goes on (reminders.py).
+
 Options (routes.json): llm, tts_voice, instructions (a file); the agent's: agent, ha_agent_id, ha_device_id,
 ha_satellite_id (agent.py).
 """
@@ -22,6 +25,7 @@ from pathlib import Path
 
 import aiohttp
 
+from .. import reminders
 from ..agent import Agent
 from ..session import Session
 from ..util import BackendUnavailable, HERE, clean_for_speech, read_instructions, wav16k
@@ -49,6 +53,12 @@ LLM_PROVIDER = (json.loads(_PROV) if _PROV else None) if _PROV is not None else 
     {"order": ["google-ai-studio/priority", "google-vertex/global/priority"], "allow_fallbacks": False}
     if LLM.startswith("google/") else None)
 LLM_HEDGE_S = float(os.environ.get("LIVE_LLM_HEDGE_S", "3.0"))  # nothing useful from the model after this long: race a 2nd identical request (0 = off)
+
+# Added to the persona for a dialog that opened with a reminder (it is not in the history: that starts with the owner).
+REMINDER_NOTE = (
+    "\n\nЭтот разговор начала ты сама: по расписанию ты только что сказала хозяину вслух: «{text}». Он может "
+    "ответить, переспросить, спросить подробности или попросить напомнить позже (тогда поставь новое напоминание "
+    "через ask_hermes). Если он просто подтвердил («ок», «спасибо», «понял») — сразу вызови end_dialog.")
 
 SENT_RE = re.compile(r"(.+?[.!?…]+[\"»)]?)(?:\s+|$)", re.S)
 
@@ -121,6 +131,10 @@ class Dialog(Session):
         log.info("dialog from %s: %s (llm %s, tts %s/%s, agent %s)", self.st.peer, self.st.hello, self.llm, TTS,
                  self.voice, self.agent.describe())
         self._warm = asyncio.create_task(self.prewarm())
+        reminder = clean_for_speech(str(self.st.hello.get("reminder") or ""))
+        if reminder:
+            self.instructions += REMINDER_NOTE.format(text=reminder)
+            reminders.join(self, reminder, self.tts_chunks)
 
     async def prewarm(self):
         """Open the connection to OpenRouter (through the proxy) while the owner is still speaking."""
@@ -138,6 +152,8 @@ class Dialog(Session):
         return self.has_unspoken_results()
 
     def on_utterance(self, pcm: bytes):
+        if self.group is not None and not self.group.won(self):
+            return  # another station of the reminder answers
         self.start_response(pcm)
 
     # ---- reply ----
@@ -211,6 +227,8 @@ class Dialog(Session):
         self.resp = asyncio.create_task(self.respond())
 
     def cancel_response(self, flush: bool):
+        if flush and self.group is not None:
+            self.group.cut_off(self)  # talked over the reminder: no more of it here
         if self.resp and not self.resp.done():
             self.orphan_pending()
         for t in (self.resp, self.tts_task):
@@ -446,34 +464,37 @@ class Dialog(Session):
             pending = ""
         return pending
 
+    async def tts_chunks(self, s: str):
+        """24 kHz s16 PCM of `s` as the TTS streams it (even-sized chunks); nothing when the TTS refuses."""
+        t0 = time.monotonic()
+        first, carry = True, b""
+        async with self.http.post(f"{OR_BASE}/audio/speech", json=tts_body(s, self.voice), headers=or_headers(),
+                                  proxy=OR_PROXY, timeout=aiohttp.ClientTimeout(total=60, sock_read=30)) as r:
+            if r.status != 200:
+                log.warning("tts HTTP %s: %s", r.status, (await r.text())[:200])
+                return
+            async for chunk in r.content.iter_chunked(4800):
+                pcm = carry + chunk
+                carry = pcm[len(pcm) // 2 * 2:]
+                pcm = pcm[:len(pcm) // 2 * 2]
+                if not pcm:
+                    continue
+                if first:
+                    first = False
+                    log.info("tts first audio %.2fs: %r", time.monotonic() - t0, s[:80])
+                yield pcm
+
     async def tts_worker(self, q: asyncio.Queue):
-        headers = or_headers()
         while True:
             s = await q.get()
             if s is None:
                 return
-            t0 = time.monotonic()
-            body = tts_body(s, self.voice)
-            first, carry = True, b""
-            async with self.http.post(f"{OR_BASE}/audio/speech", json=body, headers=headers, proxy=OR_PROXY,
-                                      timeout=aiohttp.ClientTimeout(total=60, sock_read=30)) as r:
-                if r.status != 200:
-                    log.warning("tts HTTP %s: %s", r.status, (await r.text())[:200])
-                    continue
-                async for chunk in r.content.iter_chunked(4800):
-                    pcm = carry + chunk
-                    carry = pcm[len(pcm) // 2 * 2:]
-                    pcm = pcm[:len(pcm) // 2 * 2]
-                    if not pcm:
-                        continue
-                    if first:
-                        first = False
-                        log.info("tts first audio %.2fs: %r", time.monotonic() - t0, s[:80])
-                    self.speaking = True
-                    self.touch()
-                    self.set_state("speaking")
-                    self.send(frame(b"A", pcm))
-                    await self.st.drain()
+            async for pcm in self.tts_chunks(s):
+                self.speaking = True
+                self.touch()
+                self.set_state("speaking")
+                self.send(frame(b"A", pcm))
+                await self.st.drain()
 
     async def run_call(self, c) -> str:
         try:
