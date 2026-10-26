@@ -423,7 +423,11 @@ Mini 3 notes (firmware `0.4.1.39.2634333263.20241021.factory-4`): 3 PDM mics + 1
 0/1/2, reference on ch 6 of the device = ch 3 of the stream). One VQE chunk is 768 frames (16 ms)
 and yields 256 samples @ 16 kHz, so the 512-sample assumptions (music analysis, the wake-level
 window; `frontend::level_window`) are scaled or off (`music analysis: unsupported capture
-layout`). Playback is `default` (dmix, softvol `Master`; `set_volume.sh` is `amixer set Master
+layout`). With 16 ms chunks the VQE (~0.6× real time) and the spotters (~0.8×; the alisa model's
+VAD stage ~0.15×) do not fit one thread of the 1.2 GHz Cortex-A53 (offline `ww_offline`: 8.1 s of
+CPU for 6.0 s of audio, and `capture: processing behind, dropping N frames` all the time), so
+`Model::spotter_thread` moves the spotters to the `audio-spotter` thread (`frontend::spotting`),
+fed with copies of the VQE outputs (`Engine::copy_outputs`); other models keep one thread. Playback is `default` (dmix, softvol `Master`; `set_volume.sh` is `amixer set Master
 N%`, linear). Ring: 6 RGB LEDs `bergamot:<color>:logo0..5` on `/dev/fb0` (name `logo`, 6×1, 24 bpp),
 trigger `ledfb-logo`; clock LEDs `bergamot:white:clock<A..G><0..3>` (28 segments found, colon
 `DH`/`DL`, centre `DM`, `H0..3` / `DEGREE` dark), light sensor `ltr308als01`, inputs `gpio-keys`

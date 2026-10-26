@@ -20,6 +20,9 @@ pub struct Model {
     pub mic_channels: &'static [u32],
     pub spk_channels: &'static [u32],
     pub vqe_preset: &'static str,
+    /// true: the spotters run on their own thread, fed with copies of the VQE outputs. For a
+    /// model whose VQE and spotters together take more than one core's time per chunk.
+    pub spotter_thread: bool,
 
     /// Prefix of the per-channel sysfs LEDs "<led_prefix>:<color>:<ring|logo><index>".
     pub led_prefix: &'static str,
@@ -142,6 +145,7 @@ static MIDI: Model = Model {
     mic_channels: &[0, 1, 2, 3],
     spk_channels: &[4, 5, 6, 7],
     vqe_preset: "cucumber",
+    spotter_thread: false,
     led_prefix: "cucumber",
     ring: LedStrip {
         count: 24,
@@ -205,6 +209,7 @@ static LITE2: Model = Model {
     mic_channels: &[0, 2],
     spk_channels: &[6],
     vqe_preset: "plum",
+    spotter_thread: false,
     led_prefix: "plum",
     ring: LedStrip {
         count: 3,
@@ -270,6 +275,7 @@ static MINI2: Model = Model {
     mic_channels: &[0, 1, 2, 3],
     spk_channels: &[4, 5],
     vqe_preset: "yandexmini_2",
+    spotter_thread: false,
     led_prefix: "mini2",
     ring: LedStrip {
         count: 6,
@@ -331,6 +337,7 @@ static MINI3: Model = Model {
     mic_channels: &[0, 1, 2],
     spk_channels: &[3],
     vqe_preset: "bergamot",
+    spotter_thread: true,
     led_prefix: "bergamot",
     ring: LedStrip {
         count: 6,
@@ -442,6 +449,8 @@ mod tests {
             .unwrap();
         assert_eq!(m.codename, "bergamot");
         assert_eq!(m.vqe_preset, "bergamot");
+        // 16 ms chunks: VQE + spotters take about 1.4 cores of the Cortex-A53 at 1.2 GHz.
+        assert!(m.spotter_thread);
         assert_eq!((m.mic_channels.len(), m.spk_channels.len()), (3, 1));
         // Every capture channel the VQE needs is inside the capture frame.
         let max = m.mic_channels.iter().chain(m.spk_channels).max().unwrap();

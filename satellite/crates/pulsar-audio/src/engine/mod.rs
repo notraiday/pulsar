@@ -234,12 +234,68 @@ impl Slot {
     }
 }
 
-/// The daemon's VQE + wake word spotter + optional command spotter.
+/// VQE output types the spotters can read (`SPOTTER_TO_VQE`) and the level measurement uses.
+pub(crate) const SPOTTER_OUTPUTS: [i32; 3] = [VQE_OMNI_WITH_GAIN, RAW_MAIN_MIC_SYNC, VQE_OMNI];
+
+/// Where a spotter reads its channels from: the VQE itself, or a copy of its outputs.
+pub(crate) trait Outputs {
+    /// VQE output channel `ty` of the chunk; None after an error (logged).
+    fn output(&self, ty: i32) -> Option<&[f32]>;
+}
+
+/// The VQE outputs of one chunk in [`SPOTTER_OUTPUTS`] order, copied so that the spotters can run
+/// on another thread than the VQE.
+#[derive(Default)]
+pub(crate) struct ChunkOutputs(Vec<(i32, Vec<f32>)>);
+
+impl Outputs for ChunkOutputs {
+    fn output(&self, ty: i32) -> Option<&[f32]> {
+        self.0
+            .iter()
+            .find_map(|(t, d)| (*t == ty).then_some(d.as_slice()))
+    }
+}
+
+/// The wake word spotter and the optional command spotter.
+pub(crate) struct Spotters {
+    wake: Slot,
+    cmd: Slot,
+    lib: Lib,
+    /// VQE output samples per chunk.
+    frame: usize,
+}
+
+impl Spotters {
+    fn new(lib: Lib, frame: usize) -> Self {
+        Spotters {
+            wake: Slot::new("wake word"),
+            cmd: Slot::new("command"),
+            lib,
+            frame,
+        }
+    }
+
+    /// Switches the wake word model.
+    pub fn set_wake_model(&mut self, dir: &Path) -> bool {
+        self.wake.init(&self.lib, dir, VQE_OMNI_WITH_GAIN)
+    }
+
+    /// Feeds the chunk to the wake word spotter; its confirmed phrases.
+    pub fn feed_wake(&mut self, out: &impl Outputs) -> Vec<String> {
+        feed(out, self.frame, &mut self.wake)
+    }
+
+    /// Feeds the chunk to the command spotter; its confirmed phrases.
+    pub fn feed_command(&mut self, out: &impl Outputs) -> Vec<String> {
+        feed(out, self.frame, &mut self.cmd)
+    }
+}
+
+/// The daemon's VQE + spotters.
 pub(crate) struct Engine {
     // Fields drop in declaration order: the spotters first, then the VQE (instance, then its
     // config), as the C++ engine's destructor freed them.
-    wake: Slot,
-    cmd: Slot,
+    spotters: Spotters,
     vqe: Vqe,
     lib: Lib,
     /// Capture frames per VQE chunk.
@@ -294,18 +350,17 @@ impl Engine {
         };
         info!("VQE '{preset}': {chunk} input frames -> {frame} output samples per chunk");
         let mut eng = Engine {
-            wake: Slot::new("wake word"),
-            cmd: Slot::new("command"),
+            spotters: Spotters::new(lib, frame_n),
             vqe,
             lib,
             chunk: chunk_n,
             frame: frame_n,
         };
-        if !eng.wake.init(&lib, wake_dir, VQE_OMNI_WITH_GAIN) {
+        if !eng.spotters.set_wake_model(wake_dir) {
             return None;
         }
         if let Some(dir) = command_dir
-            && !eng.cmd.init(&lib, dir, VQE_OMNI)
+            && !eng.spotters.cmd.init(&lib, dir, VQE_OMNI)
         {
             warn!("command spotter unavailable; voice commands without the wake word are disabled");
         }
@@ -314,7 +369,7 @@ impl Engine {
 
     /// Switches the wake word model.
     pub fn set_wake_model(&mut self, dir: &Path) -> bool {
-        self.wake.init(&self.lib, dir, VQE_OMNI_WITH_GAIN)
+        self.spotters.set_wake_model(dir)
     }
 
     /// One VQE chunk; false after an error (logged).
@@ -335,16 +390,44 @@ impl Engine {
 
     /// Feeds the last chunk to the wake word spotter; its confirmed phrases.
     pub fn feed_wake(&mut self) -> Vec<String> {
-        feed(&self.vqe, self.frame, &mut self.wake)
+        self.spotters.feed_wake(&VqeOutputs(&self.vqe))
     }
 
     /// Feeds the last chunk to the command spotter; its confirmed phrases.
     pub fn feed_command(&mut self) -> Vec<String> {
-        feed(&self.vqe, self.frame, &mut self.cmd)
+        self.spotters.feed_command(&VqeOutputs(&self.vqe))
+    }
+
+    /// Hands the spotters over to another thread, which gets the chunks through
+    /// [`Engine::copy_outputs`]; the engine feeds none afterwards.
+    pub fn take_spotters(&mut self) -> Spotters {
+        std::mem::replace(&mut self.spotters, Spotters::new(self.lib, self.frame))
+    }
+
+    /// The spotter inputs of the last chunk, copied.
+    pub fn copy_outputs(&self) -> ChunkOutputs {
+        ChunkOutputs(
+            SPOTTER_OUTPUTS
+                .iter()
+                .map(|&ty| (ty, self.output(ty).map(<[f32]>::to_vec).unwrap_or_default()))
+                .collect(),
+        )
     }
 }
 
-fn feed(vqe: &Vqe, frame: usize, s: &mut Slot) -> Vec<String> {
+/// [`Outputs`] of the VQE's last chunk.
+struct VqeOutputs<'a>(&'a Vqe);
+
+impl Outputs for VqeOutputs<'_> {
+    fn output(&self, ty: i32) -> Option<&[f32]> {
+        self.0
+            .output(ty)
+            .inspect_err(|e| error!("VQE output: {e}"))
+            .ok()
+    }
+}
+
+fn feed(vqe: &impl Outputs, frame: usize, s: &mut Slot) -> Vec<String> {
     let nch = s.vqe.len();
     let Some(sp) = s.sp.as_mut() else {
         return Vec::new();
@@ -355,16 +438,11 @@ fn feed(vqe: &Vqe, frame: usize, s: &mut Slot) -> Vec<String> {
     let mut src: [&[f32]; MAX_SPOTTER_CHANNELS] = [&[]; MAX_SPOTTER_CHANNELS];
     let mut n = frame;
     for (k, &ty) in s.vqe.iter().enumerate() {
-        match vqe.output(ty) {
-            Ok(d) => {
-                n = n.min(d.len());
-                src[k] = d;
-            }
-            Err(e) => {
-                error!("VQE output: {e}");
-                return Vec::new();
-            }
-        }
+        let Some(d) = vqe.output(ty) else {
+            return Vec::new();
+        };
+        n = n.min(d.len());
+        src[k] = d;
     }
     s.buf.resize(n * nch, 0);
     for (i, out) in s.buf.chunks_exact_mut(nch).enumerate() {
@@ -408,6 +486,15 @@ mod tests {
         let l = spotter_layout(&[2, 1, 1, 1, 1, 2], VQE_OMNI_WITH_GAIN);
         assert_eq!(l.types, [0, 0, 1, 2, 3, 4, 5, 5]);
         assert_eq!(l.vqe, [9, 9, 2, 9, 2, 6, 6, 6]);
+    }
+
+    #[test]
+    fn chunk_outputs_are_looked_up_by_type() {
+        let out = ChunkOutputs(vec![(9, vec![1.0]), (6, vec![2.0, 3.0])]);
+        assert_eq!(out.output(6), Some(&[2.0, 3.0][..]));
+        assert_eq!(out.output(9), Some(&[1.0][..]));
+        assert_eq!(out.output(2), None);
+        assert_eq!(ChunkOutputs::default().output(6), None);
     }
 
     #[test]

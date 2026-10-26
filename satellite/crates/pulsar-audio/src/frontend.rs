@@ -4,13 +4,14 @@
 //! and, optionally, the command model ("стоп", "громче", ...).
 //!
 //! Two threads: a capture thread that only drains ALSA into a FIFO, and a processing thread
-//! (VQE + spotters). The Lite 2's PDM capture allows at most ~42 ms of buffer (2048 frames at
+//! (VQE + spotters; a third, the spotters alone, where `Model::spotter_thread`). The Lite 2's PDM capture allows at most ~42 ms of buffer (2048 frames at
 //! 8 ch S16); VQE chunks occasionally take longer than the remaining slack, which overran the
 //! device buffer when reading and processing shared one thread.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -21,7 +22,9 @@ use pulsar_core::MusicFrame;
 use pulsar_core::model::Model;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use crate::engine::{Engine, VQE_OMNI, VQE_OMNI_WITH_GAIN, to_s16};
+use crate::engine::{
+    ChunkOutputs, Engine, Outputs, Spotters, VQE_OMNI, VQE_OMNI_WITH_GAIN, to_s16,
+};
 use crate::spectrum::SpectrumAnalyzer;
 
 /// Wake word level window: 1.5 s of 32 ms VQE frames (512 samples @ 16 kHz on the Midi, Lite 2
@@ -49,6 +52,9 @@ const CHUNK_WAIT: Duration = Duration::from_millis(500);
 // The VQE and the spotters run on the processing thread; the C++ daemon ran them on a default
 // glibc thread (8 MiB stack), Rust's default is 2 MiB.
 const PROCESSING_STACK: usize = 8 << 20;
+/// VQE chunks the spotter thread may lag behind; past that the processing thread waits for it
+/// (and the capture FIFO's limit of 1 s decides what is dropped).
+const SPOTTER_QUEUE: usize = 16;
 
 pub enum FrontendEvent {
     /// level_db: wake word level in dBFS on VQE_OMNI (after echo cancellation, before AGC),
@@ -263,12 +269,27 @@ impl Inner {
                 .name("audio-capture".into())
                 .spawn(move || capture(model, period, &shared, &p))?,
         );
+        // VQE and spotters together take more than a core's time per chunk on some models: the
+        // spotters get a thread of their own, fed with copies of the VQE outputs.
+        let mut eng = eng;
+        let spot = if model.spotter_thread {
+            let spotters = eng.take_spotters();
+            let (spot_tx, spot_rx) = sync_channel(SPOTTER_QUEUE);
+            let (shared, tx, frame) = (self.shared.clone(), tx.clone(), eng.frame);
+            let join = std::thread::Builder::new()
+                .name("audio-spotter".into())
+                .stack_size(PROCESSING_STACK)
+                .spawn(move || spotting(spotters, frame, &shared, &spot_rx, &tx))?;
+            Some((spot_tx, join))
+        } else {
+            None
+        };
         let shared = self.shared.clone();
         self.threads.push(
             std::thread::Builder::new()
                 .name("audio-process".into())
                 .stack_size(PROCESSING_STACK)
-                .spawn(move || processing(model, eng, &shared, &pipe, &tx))?,
+                .spawn(move || processing(model, eng, &shared, &pipe, &tx, spot))?,
         );
         Ok(())
     }
@@ -527,13 +548,86 @@ fn mean_square(d: &[f32]) -> f32 {
     (sq / d.len() as f64) as f32
 }
 
+/// Mean square per VQE frame over the level window.
+struct LevelTracker {
+    hist: Vec<f32>,
+    pos: usize,
+    top: usize,
+}
+
+impl LevelTracker {
+    fn new(frame: usize) -> Self {
+        let (n, top) = level_window(frame);
+        LevelTracker {
+            hist: vec![0f32; n],
+            pos: 0,
+            top,
+        }
+    }
+
+    fn push(&mut self, d: &[f32]) {
+        self.hist[self.pos] = mean_square(d);
+        self.pos = (self.pos + 1) % self.hist.len();
+    }
+
+    fn db(&self) -> f32 {
+        wake_level_db(&self.hist, self.top)
+    }
+}
+
+/// The spotter thread: the chunks the processing thread copies from the VQE, in order, until it
+/// drops its end.
+fn spotting(
+    mut sp: Spotters,
+    frame: usize,
+    shared: &Shared,
+    rx: &Receiver<ChunkOutputs>,
+    tx: &UnboundedSender<FrontendEvent>,
+) {
+    let mut level = LevelTracker::new(frame);
+    while let Ok(out) = rx.recv() {
+        let pending = lock(&shared.pending_model).take();
+        if let Some(dir) = pending
+            && !sp.set_wake_model(&dir)
+        {
+            error!("failed to switch wake word model to {}", dir.display());
+        }
+        if let Some(d) = out.output(VQE_OMNI)
+            && !d.is_empty()
+        {
+            level.push(d);
+        }
+        if shared.detect.load(Relaxed) {
+            let phrases = sp.feed_wake(&out);
+            if !phrases.is_empty() {
+                let level_db = level.db();
+                for phrase in phrases {
+                    let _ = tx.send(FrontendEvent::Wake { phrase, level_db });
+                }
+            }
+        }
+        if shared.commands.load(Relaxed) {
+            for word in sp.feed_command(&out) {
+                let _ = tx.send(FrontendEvent::Command { word });
+            }
+        }
+    }
+}
+
 fn processing(
     model: &'static Model,
     mut eng: Engine,
     shared: &Shared,
     pipe: &Pipe,
     tx: &UnboundedSender<FrontendEvent>,
+    spot: Option<(SyncSender<ChunkOutputs>, JoinHandle<()>)>,
 ) {
+    let (mut spot_tx, spot_join) = match spot {
+        Some((t, j)) => (Some(t), Some(j)),
+        None => (None, None),
+    };
+    // With a spotter thread the wake model switch and the level window are its business.
+    let threaded = spot_tx.is_some();
     let period = eng.chunk;
     let nch = model.capture_channels as usize;
     let (mic_ch, spk_ch) = (model.mic_channels, model.spk_channels);
@@ -541,10 +635,7 @@ fn processing(
     let mut input = vec![0i16; period * nch];
     let mut mics = vec![0f32; period * mic_ch.len()];
     let mut spk = vec![0f32; period * nspk];
-    // Mean square per VQE frame.
-    let (level_n, level_top) = level_window(eng.frame);
-    let mut level_hist = vec![0f32; level_n];
-    let mut level_pos = 0;
+    let mut level = LevelTracker::new(eng.frame);
     let mut ana = SpectrumAnalyzer::new(model.capture_rate, period);
     if !ana.ok() {
         warn!("music analysis: unsupported capture layout");
@@ -552,11 +643,13 @@ fn processing(
     let mut music_was_on = false;
 
     while shared.running() {
-        let pending = lock(&shared.pending_model).take();
-        if let Some(dir) = pending
-            && !eng.set_wake_model(&dir)
-        {
-            error!("failed to switch wake word model to {}", dir.display());
+        if !threaded {
+            let pending = lock(&shared.pending_model).take();
+            if let Some(dir) = pending
+                && !eng.set_wake_model(&dir)
+            {
+                error!("failed to switch wake word model to {}", dir.display());
+            }
         }
         // Exactly one VQE chunk.
         {
@@ -589,11 +682,11 @@ fn processing(
         // VQE_OMNI is cleaned of the station's own playback but has no AGC, so it keeps the
         // distance to the talker; VQE_OMNI_WITH_GAIN, which the spotter hears, normalizes it
         // away.
-        if let Some(d) = eng.output(VQE_OMNI)
+        if !threaded
+            && let Some(d) = eng.output(VQE_OMNI)
             && !d.is_empty()
         {
-            level_hist[level_pos] = mean_square(d);
-            level_pos = (level_pos + 1) % level_n;
+            level.push(d);
         }
 
         if shared.stream.load(Relaxed)
@@ -603,10 +696,17 @@ fn processing(
             let _ = tx.send(FrontendEvent::Audio(d.iter().map(|&v| to_s16(v)).collect()));
         }
 
+        if let Some(t) = &spot_tx {
+            if t.send(eng.copy_outputs()).is_err() {
+                error!("audio-spotter thread stopped: no wake word or command detection");
+                spot_tx = None;
+            }
+            continue;
+        }
         if shared.detect.load(Relaxed) {
             let phrases = eng.feed_wake();
             if !phrases.is_empty() {
-                let level_db = wake_level_db(&level_hist, level_top);
+                let level_db = level.db();
                 for phrase in phrases {
                     let _ = tx.send(FrontendEvent::Wake { phrase, level_db });
                 }
@@ -617,6 +717,11 @@ fn processing(
                 let _ = tx.send(FrontendEvent::Command { word });
             }
         }
+    }
+    // The spotters (the C++ engine freed them before the VQE) end first.
+    drop(spot_tx);
+    if let Some(j) = spot_join {
+        let _ = j.join();
     }
 }
 
@@ -648,6 +753,19 @@ mod tests {
         // Clamped to -100..0.
         assert_eq!(wake_level_db(&at(3.0), LEVEL_TOP), 0.0);
         assert_eq!(wake_level_db(&at(-120.0), LEVEL_TOP), -100.0);
+    }
+
+    #[test]
+    fn level_tracker_follows_the_window_of_its_frame_length() {
+        let mut t = LevelTracker::new(256);
+        assert_eq!((t.hist.len(), t.top), (94, 16));
+        assert_eq!(t.db(), -100.0);
+        for _ in 0..200 {
+            t.push(&[0.1; 256]);
+        }
+        // Mean square 0.01.
+        assert_eq!(t.db(), -20.0);
+        assert_eq!(t.pos, 200 % 94);
     }
 
     #[test]
