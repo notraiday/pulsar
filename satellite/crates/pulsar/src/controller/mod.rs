@@ -4,6 +4,7 @@
 //! through channels, which `run` serves one event at a time (no re-entrant hooks as in C++).
 
 mod entities;
+mod live;
 mod logic;
 mod media;
 mod voice;
@@ -19,6 +20,7 @@ use pulsar_esphome::{ApiConfig, ApiEvent, ApiHandle, WakeWordInfo};
 use pulsar_hw::{InputEvent, InputHandle, LedsHandle, Rgb};
 use pulsar_lan::arbiter::{self, ArbiterEvent, ArbiterHandle};
 use pulsar_lan::mdns::{self, MdnsHandle, MdnsService};
+use pulsar_live::{LiveEvent, LiveHandle};
 use pulsar_media::{Channel, Mixer, PlayId, PlayState, PlayerEvent, PlayerHandle};
 use pulsar_sendspin::{SendspinConfig, SendspinEvent, SendspinHandle};
 use pulsar_update::{Release, UpdateEvent, UpdaterHandle};
@@ -85,6 +87,10 @@ enum Tk {
     UpdateRetry,
     /// Exit after an installed update.
     UpdateExit,
+    /// A Live dialog reached its length limit.
+    LiveMax,
+    /// The last words of an ended Live dialog did not finish playing.
+    LiveTail,
 }
 
 /// What a `play()` was for: the C++ completion callback and the values it captured.
@@ -113,6 +119,7 @@ struct Rx {
     sendspin: Option<UnboundedReceiver<SendspinEvent>>,
     zigbee: Option<UnboundedReceiver<ZigbeeEvent>>,
     updater: Option<UnboundedReceiver<UpdateEvent>>,
+    live: Option<UnboundedReceiver<LiveEvent>>,
 }
 
 /// Next event of an optional channel; never ready without one.
@@ -132,6 +139,7 @@ pub struct Controller {
     zigbee: Option<ZigbeeHandle>,
     updater: UpdaterHandle,
     arbiter: ArbiterHandle,
+    live: LiveHandle,
     /// Held only: the input actor runs while its handle exists.
     _input: Option<InputHandle>,
     clock: pulsar_clock::ClockHandle,
@@ -146,6 +154,10 @@ pub struct Controller {
     int: Signal,
 
     model: &'static Model,
+    /// Directory of state.conf.
+    state_dir: PathBuf,
+    /// DeviceIdentity::name, told to the Live bridge.
+    station: String,
     state: StateFile,
     st: Settings,
     timers: Timers<Tk>,
@@ -156,6 +168,8 @@ pub struct Controller {
     applied_tz: String,
 
     phase: Phase,
+    /// A Live dialog (see `live.rs`); `phase` stays Idle meanwhile.
+    live_dialog: Option<live::Dialog>,
     /// Start of the current LISTENING phase (commands window).
     listen_started_ms: i64,
     hw_mic_muted: bool,
@@ -337,6 +351,7 @@ impl Controller {
         // C code on another thread could be reading.
         let (player, player_rx) = pulsar_media::spawn(model.playback_pcm);
         let (arbiter, arbiter_rx) = arbiter::spawn(id.name.clone(), ports.arbiter);
+        let (live, live_rx) = pulsar_live::spawn(model.playback_pcm);
 
         // Hardware first: UI feedback should work even if HA is not connected.
         let leds = pulsar_hw::spawn_leds(model);
@@ -522,6 +537,7 @@ impl Controller {
             zigbee,
             updater,
             arbiter,
+            live,
             _input: input,
             clock,
             leds,
@@ -540,10 +556,13 @@ impl Controller {
                 sendspin: sendspin_rx,
                 zigbee: zigbee_rx,
                 updater: Some(updater_rx),
+                live: Some(live_rx),
             },
             term,
             int,
             model,
+            state_dir: dir.clone(),
+            station: id.name.clone(),
             state: StateFile::new(state_path),
             st,
             timers: Timers::new(),
@@ -551,6 +570,7 @@ impl Controller {
             exit: None,
             applied_tz,
             phase: Phase::Idle,
+            live_dialog: None,
             listen_started_ms: 0,
             hw_mic_muted,
             error_shown: false,
@@ -678,6 +698,10 @@ impl Controller {
                     Some(ev) => self.on_updater(ev),
                     None => self.rx.updater = None,
                 },
+                ev = recv(&mut self.rx.live) => match ev {
+                    Some(ev) => self.on_live(ev),
+                    None => self.rx.live = None,
+                },
                 lux = recv(&mut self.rx.lux) => match lux {
                     Some(lux) => self.on_lux(lux),
                     None => self.rx.lux = None,
@@ -717,6 +741,8 @@ impl Controller {
             Tk::UpdateRetry => self.maybe_auto_update(),
             // exit 0: supervise.sh starts the new binary
             Tk::UpdateExit => self.exit = Some(ExitReason::Updated),
+            Tk::LiveMax => self.end_live("session length limit"),
+            Tk::LiveTail => self.teardown_live(),
         }
     }
 
@@ -748,7 +774,9 @@ impl Controller {
             FrontendEvent::Wake { phrase, level_db } => self.on_wake(&phrase, level_db),
             FrontendEvent::Command { word } => self.on_command(&word, false),
             FrontendEvent::Audio(pcm) => {
-                if self.phase == Phase::Listening {
+                if self.live_streaming() {
+                    self.live.send_audio(pcm);
+                } else if self.phase == Phase::Listening {
                     self.api.voice_send_audio(pcm);
                 } else if self.arbitrating {
                     // The request goes on with what was said right after the wake word.
@@ -803,6 +831,8 @@ impl Controller {
         self.update_commands();
         let s = if self.timer_ringing {
             UiState::TimerRing
+        } else if let Some(d) = &self.live_dialog {
+            d.ui_state()
         } else {
             match self.phase {
                 Phase::Listening => UiState::Listening,

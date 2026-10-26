@@ -16,7 +16,7 @@ impl Controller {
             self.announcing,
             self.timer_ringing,
             self.closing_earcon,
-        );
+        ) || self.live_active();
         if want == self.ducked {
             return;
         }
@@ -40,6 +40,7 @@ impl Controller {
         if let Some(ss) = &self.sendspin {
             ss.set_duck_gain(music);
         }
+        self.live.set_gain(if self.st.muted { 0.0 } else { 1.0 });
     }
 
     pub(super) fn set_muted(&mut self, m: bool) {

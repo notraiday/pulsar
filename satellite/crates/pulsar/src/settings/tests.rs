@@ -118,6 +118,22 @@ fn load_then_save_matches_cxx() {
     }
 }
 
+#[test]
+fn live_bridge_is_written_only_when_set_and_read_back() {
+    let plain = Settings::default().serialize();
+    assert!(!plain.contains("live_bridge") && !plain.contains("voice_mode"));
+    let mut s = Settings::default();
+    s.parse(b"live_bridge=192.168.1.50:10700\nvoice_mode=Home Assistant\n");
+    // voice_mode belongs to the C++ build's switch: ignored here.
+    assert_eq!(s.live_bridge, "192.168.1.50:10700");
+    let text = s.serialize();
+    assert!(text.ends_with("live_bridge=192.168.1.50:10700\nvoice_mode=Live\n"));
+    let mut back = Settings::default();
+    back.parse(text.as_bytes());
+    assert_eq!(back.live_bridge, s.live_bridge);
+    assert_eq!(back.serialize(), text);
+}
+
 /// A fresh directory under the system temp dir, removed on drop.
 struct TmpDir(std::path::PathBuf);
 

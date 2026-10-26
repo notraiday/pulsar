@@ -138,6 +138,7 @@ impl Controller {
                     logic::sw_mute_after_switch(state, self.st.mic_muted, self.hw_mic_muted);
                 if !state {
                     self.cancel_arbitration();
+                    self.end_live("microphones muted");
                     if self.phase == logic::Phase::Listening {
                         self.finish_interaction();
                     }
@@ -357,6 +358,7 @@ impl Controller {
             InputEvent::Mute(m) => {
                 if m {
                     self.cancel_arbitration();
+                    self.end_live("microphone button");
                 }
                 self.hw_mic_muted = m;
                 info!("hardware mic mute: {}", u8::from(m));
@@ -474,14 +476,15 @@ impl Controller {
     }
 
     fn idle_for_update(&self) -> bool {
-        logic::idle_for_update(
-            self.phase,
-            self.announcing,
-            self.timer_ringing,
-            self.player.state(Channel::Music),
-            self.sendspin_streaming(),
-            self.zigbee_flashing(),
-        )
+        !self.live_active()
+            && logic::idle_for_update(
+                self.phase,
+                self.announcing,
+                self.timer_ringing,
+                self.player.state(Channel::Music),
+                self.sendspin_streaming(),
+                self.zigbee_flashing(),
+            )
     }
 
     pub(super) fn maybe_auto_update(&mut self) {

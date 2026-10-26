@@ -69,6 +69,9 @@ pub struct Settings {
     /// Radio image version given up on (the radio did not take it); not written again until the
     /// role changes or another image version is installed.
     pub zigbee_flash_failed: u32,
+    /// "host:port" of the Live bridge; empty = none. The `live_bridge` file in the state
+    /// directory, read at each dialog, takes precedence (see `Controller::live_bridge`).
+    pub live_bridge: String,
 }
 
 impl Default for Settings {
@@ -96,6 +99,7 @@ impl Default for Settings {
             update_attempt: String::new(),
             zigbee_role: Mode::Off,
             zigbee_flash_failed: 0,
+            live_bridge: String::new(),
         }
     }
 }
@@ -164,6 +168,7 @@ impl Settings {
                 }
                 b"voice_indication" => self.voice_indication = on,
                 b"led_case_color" => self.led_case_color = v,
+                b"live_bridge" => self.live_bridge = v,
                 _ => {}
             }
         }
@@ -179,7 +184,7 @@ impl Settings {
     pub fn serialize(&self) -> String {
         let f = |v: f32| g6(f64::from(v));
         let b = |v: bool| u8::from(v);
-        format!(
+        let mut text = format!(
             "volume2={}\nvolume={}\nmuted={}\nmic_muted={}\nclock_on={}\nclock_brightness={}\n\
              clock_scroll_ms={}\nlight_on={}\nlight_brightness={}\nlight_r={}\nlight_g={}\n\
              light_b={}\nlight_effect={}\nwake_word={}\ntz={}\nauto_update={}\nupdate_attempt={}\n\
@@ -210,7 +215,17 @@ impl Settings {
             b(self.voice_indication),
             self.led_case_color,
             self.clock_music,
-        )
+        );
+        // Only when set, so a station without Live writes the file the C++ build wrote.
+        // `voice_mode=Live` is what the C++ build with Live reads next to it (a rollback to it
+        // keeps the dialogs); this build has no such switch: the bridge decides.
+        if !self.live_bridge.is_empty() {
+            text.push_str(&format!(
+                "live_bridge={}\nvoice_mode=Live\n",
+                self.live_bridge
+            ));
+        }
+        text
     }
 
     /// Atomic and durable: written to `<path>.tmp` (the C++ daemon's name; a leftover one is

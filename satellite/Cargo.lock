@@ -279,6 +279,7 @@ dependencies = [
  "pulsar-esphome",
  "pulsar-hw",
  "pulsar-lan",
+ "pulsar-live",
  "pulsar-media",
  "pulsar-sendspin",
  "pulsar-update",
@@ -356,6 +357,18 @@ version = "0.0.0"
 dependencies = [
  "libc",
  "log",
+ "pulsar-core",
+ "socket2",
+ "tokio",
+]
+
+[[package]]
+name = "pulsar-live"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "log",
+ "pulsar-alsa",
  "pulsar-core",
  "socket2",
  "tokio",

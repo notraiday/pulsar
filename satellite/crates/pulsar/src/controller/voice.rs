@@ -50,6 +50,7 @@ impl Controller {
                     if ok
                         && conv
                         && self.phase == Phase::Idle
+                        && !self.live_active()
                         && !self.timer_ringing
                         && !self.mic_muted()
                     {
@@ -122,6 +123,16 @@ impl Controller {
             }
             return self.stop_timer_ring();
         }
+        if let Some(live) = &self.live_dialog {
+            if live.is_closing() {
+                self.teardown_live(); // the last words of an ended dialog give way to a new one
+            } else {
+                // The bridge hears the speech itself: the wake word only cuts the answer.
+                info!("live: wake word during the dialog, answer cut");
+                self.live.flush_playback();
+                return;
+            }
+        }
         if matches!(self.phase, Phase::Listening | Phase::Processing) || self.arbitrating {
             return;
         }
@@ -151,6 +162,11 @@ impl Controller {
         }
         if self.phase == Phase::Speaking || self.announcing {
             self.interrupt_speech(); // barge-in: cut the answer short
+        }
+        // The bridge answers when there is one; it hands the dialog back to Home Assistant, or
+        // cannot be reached, by itself (`live_ended`).
+        if let Some(bridge) = self.live_bridge() {
+            return self.start_live(bridge, preroll);
         }
         self.start_pipeline(phrase, true, preroll);
     }
@@ -199,7 +215,7 @@ impl Controller {
         self.arb_claim = None;
         self.arb_audio.clear();
         self.arb_command.clear();
-        if self.phase != Phase::Listening {
+        if self.phase != Phase::Listening && !self.live_streaming() {
             self.mic.set_streaming(false);
         }
     }
@@ -384,7 +400,8 @@ impl Controller {
         }
         self.run.awaiting_run_start = false;
         self.send_tts_report(false);
-        self.mic.set_streaming(self.arbitrating);
+        self.mic
+            .set_streaming(self.arbitrating || self.live_streaming());
         self.phase = Phase::Idle;
         self.dialog += 1;
         self.tts_played = false;
@@ -468,12 +485,18 @@ impl Controller {
         if self.timer_ringing {
             return self.stop_timer_ring();
         }
+        if self.live_active() {
+            return self.end_live("button");
+        }
         if matches!(self.phase, Phase::Listening | Phase::Processing) {
             return self.cancel_dialog();
         }
         if self.phase == Phase::Speaking || self.announcing {
             self.interrupt_speech();
             return self.finish_interaction();
+        }
+        if let Some(bridge) = self.live_bridge() {
+            return self.start_live(bridge, Vec::new());
         }
         self.start_pipeline("", true, Vec::new());
     }
@@ -683,6 +706,20 @@ impl Controller {
         let Some(c) = logic::command_of(word) else {
             return;
         };
+        if self.live_streaming() {
+            // The bridge's model handles everything but ending the dialog and the volume.
+            info!("voice command '{word}' in a live dialog");
+            match c {
+                VoiceCommand::Stop if self.timer_ringing => self.stop_timer_ring(),
+                VoiceCommand::Stop => self.end_live("stop command"),
+                VoiceCommand::Louder | VoiceCommand::Quieter => {
+                    let step = if c == VoiceCommand::Louder { 0.1 } else { -0.1 };
+                    self.set_volume(self.st.volume + step, true);
+                }
+                _ => {}
+            }
+            return;
+        }
         if now_ms() < self.commands_blocked_until_ms {
             info!("voice command '{word}' ignored: another station answers this wake word");
             return;
