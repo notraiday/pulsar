@@ -57,6 +57,7 @@ TTS_STYLE = os.environ.get("LIVE_TTS_STYLE", (
 DIRECT_MAX = int(os.environ.get("LIVE_DIRECT_MAX", "260"))  # Hermes answers up to this many chars are spoken as they are (0 = always reword)
 LLM_TIMEOUT = float(os.environ.get("LIVE_LLM_TIMEOUT", "60"))
 LLM_HEDGE_S = float(os.environ.get("LIVE_LLM_HEDGE_S", "1.5"))  # nothing useful from the model after this long: race a 2nd identical request (0 = off)
+TTS_HEDGE_S = float(os.environ.get("LIVE_TTS_HEDGE_S", "0.8"))  # no audio after this long: race a 2nd TTS request (0 = off)
 AGENT_RACE = os.environ.get("LIVE_AGENT_RACE", "1") != "0"  # first turn: the agent is asked with the transcript at once
 ZDR_PROVIDER = {"zdr": True, "data_collection": "deny"}
 COVERED = object()  # run_call: the first ask of the round got the whole utterance
@@ -592,24 +593,67 @@ class Dialog(Session):
         return pending
 
     async def tts_chunks(self, s: str):
-        """24 kHz s16 PCM of `s` as the TTS streams it (even-sized chunks); nothing when the TTS refuses."""
+        """24 kHz s16 PCM of `s` as the TTS streams it (even-sized chunks); nothing when the TTS refuses. OpenRouter
+        hands ElevenLabs audio over whole (0.27 s for a few words, ~0.45 s for 130 chars), but now and then takes
+        1-1.5 s: with no audio after TTS_HEDGE_S a second identical request is raced, the first to deliver wins."""
         t0 = time.monotonic()
-        first, carry = True, b""
-        async with self.http.post(f"{OR_BASE}/audio/speech", json=tts_body(s, self.voice), headers=or_headers(),
-                                  proxy=OR_PROXY, timeout=aiohttp.ClientTimeout(total=60, sock_read=30)) as r:
-            if r.status != 200:
-                log.warning("tts HTTP %s: %s", r.status, (await r.text())[:200])
-                return
-            async for chunk in r.content.iter_chunked(4800):
-                pcm = carry + chunk
+        q: asyncio.Queue = asyncio.Queue()
+
+        async def attempt(i: int):
+            try:
+                async with self.http.post(f"{OR_BASE}/audio/speech", json=tts_body(s, self.voice), headers=or_headers(),
+                                          proxy=OR_PROXY, timeout=aiohttp.ClientTimeout(total=60, sock_read=30)) as r:
+                    if r.status != 200:
+                        await q.put((i, "err", f"tts HTTP {r.status}: {(await r.text())[:200]}"))
+                        return
+                    async for chunk in r.content.iter_chunked(4800):
+                        await q.put((i, "pcm", chunk))
+                await q.put((i, "end", None))
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                await q.put((i, "err", f"tts failed: {e!r}"))
+
+        tasks = {0: asyncio.create_task(attempt(0))}
+        winner, hedged, first, carry = None, False, True, b""
+        try:
+            while True:
+                wait = None
+                if winner is None and not hedged and TTS_HEDGE_S > 0:
+                    wait = max(0.01, TTS_HEDGE_S - (time.monotonic() - t0))
+                try:
+                    i, kind, val = await asyncio.wait_for(q.get(), wait)
+                except asyncio.TimeoutError:
+                    hedged = True
+                    log.info("tts silent for %.1fs, racing a second request: %r", TTS_HEDGE_S, s[:60])
+                    tasks[1] = asyncio.create_task(attempt(1))
+                    continue
+                if winner is not None and i != winner:
+                    continue
+                if kind != "pcm":
+                    tasks.pop(i, None)
+                    if winner is None and tasks:
+                        continue  # the other request may still deliver
+                    if kind == "err":
+                        log.warning("%s", val)
+                    return
+                if winner is None:
+                    winner = i
+                    for j, t in tasks.items():
+                        if j != i:
+                            t.cancel()
+                pcm = carry + val
                 carry = pcm[len(pcm) // 2 * 2:]
                 pcm = pcm[:len(pcm) // 2 * 2]
                 if not pcm:
                     continue
                 if first:
                     first = False
-                    log.info("tts first audio %.2fs: %r", time.monotonic() - t0, s[:80])
+                    log.info("tts first audio %.2fs%s: %r", time.monotonic() - t0, " (2nd request)" if i else "", s[:80])
                 yield pcm
+        finally:
+            for t in tasks.values():
+                t.cancel()
 
     async def tts_worker(self, q: asyncio.Queue):
         while True:

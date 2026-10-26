@@ -386,3 +386,33 @@ def test_the_early_request_is_dropped_when_the_model_answers_itself(tmp_path, mo
 def test_later_turns_ask_the_agent_with_the_models_request(tmp_path, monkeypatch, fake_vad):
     seen, got = run_race(tmp_path, monkeypatch, turns=2)
     assert [c for _, c in seen["hermes"]] == [f"@@LIVE@@ {TRANSCRIPT}", "@@LIVE@@ просьба модели 2"]
+
+
+# ---- TTS: a stalled request is raced ----
+
+
+def test_a_stalled_tts_request_loses_to_a_second_one(monkeypatch, fake_vad):
+    calls = []
+
+    async def speech(req):
+        calls.append(time.monotonic())
+        if len(calls) == 1:
+            await asyncio.sleep(2)  # the stall
+        return web.Response(body=b"\x10\x00" * 2400)
+
+    app = web.Application()
+    app.router.add_post("/audio/speech", speech)
+    monkeypatch.setattr(pipeline, "TTS_HEDGE_S", 0.2)
+
+    async def go():
+        runner, port = await serve_app(app)
+        monkeypatch.setattr(pipeline, "OR_BASE", f"http://127.0.0.1:{port}")
+        async with aiohttp.ClientSession() as http:
+            d = pipeline.Dialog(wire.Station(None, W(), {}), http)
+            t0 = time.monotonic()
+            pcm = b"".join([c async for c in d.tts_chunks("Привет.")])
+            took = time.monotonic() - t0
+        await runner.cleanup()
+        return pcm, took
+    pcm, took = asyncio.run(go())
+    assert len(pcm) == 4800 and len(calls) == 2 and took < 2
