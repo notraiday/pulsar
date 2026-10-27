@@ -345,7 +345,7 @@ class Dialog(Session):
             self.release()
             return
         self.overlap = False
-        if self.turn_open and (self.speaking or (self.resp is not None and not self.resp.done())):
+        if self.speaking or (self.turn_open and self.resp is not None and not self.resp.done()):
             log.info("the owner said something with words over the answer %s: cutting it",
                      "playing" if self.speaking else "being made")
             self.cancel_response(flush=True)
@@ -566,7 +566,9 @@ class Dialog(Session):
     def start_response(self, pcm: bytes, text: str | None = None, pending=None):
         """`text`: a transcript already made (a short utterance the STT kept: it always goes to the model);
         `pending`: the transcript being made ahead (stt.py)."""
-        self.cancel_response(flush=False)
+        # if the previous answer is still playing (or has audio queued on the station), cut it — a new turn that
+        # reaches here while we are talking must replace what is playing, not queue behind it
+        self.cancel_response(flush=self.speaking or time.monotonic() < self.play_end)
         self.turn_end = time.monotonic()
         self.turn_open = True
         self.set_state("thinking")
