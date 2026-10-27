@@ -240,11 +240,52 @@ docker exec live-bridge python -m livebridge.probe --agent both -n 3 "Котор
 Переменные окружения моста: `LIVE_LISTEN`, `LIVE_ROUTES`, `LIVE_DEFAULT_BACKEND`, `LIVE_INSTRUCTIONS`;
 агент: `LIVE_AGENT` (`hermes` | `ha`), `HA_URL`, `HA_TOKEN`, `HA_AGENT_ID`, `HA_LANGUAGE` (`ru`),
 `LIVE_HA_KEEP_CONVERSATION` (`1`; `0` — каждый запрос отдельным разговором), `LIVE_AGENT_TIMEOUT`
-(иначе `HERMES_TIMEOUT`, 120 с), `HERMES_URL` / `HERMES_KEY`, `HERMES_MARK`; `pipeline`: `OPENROUTER_API_KEY`,
+(иначе `HERMES_TIMEOUT`, 1800 с: фоновые просьбы тоже), `LIVE_AGENT_SILENT_S` (900), `HERMES_URL` / `HERMES_KEY`, `HERMES_MARK`; вопросы агента: `LIVE_SURFACE_LISTEN`, `LIVE_SURFACE_TOKEN`, `LIVE_ASK_TIMEOUT_S` (120), `LIVE_AGENT_DETACH_S` (20); `pipeline`: `OPENROUTER_API_KEY`,
 `LIVE_ZDR`, `LIVE_OR_PROXY`, `LIVE_LLM`, `LIVE_LLM_PROVIDER`, `LIVE_REASONING`, `LIVE_LLM_HEDGE_S`,
 `LIVE_TTS`, `LIVE_TTS_VOICE`, `LIVE_TTS_HEDGE_S`, `LIVE_AGENT_RACE` и остальные `LIVE_*` (заголовок
 `pipeline.py` и `session.py`); `gpt-live`: `OPENAI_API_KEY`, `LIVE_GPT_URL`, `LIVE_GPT_MODEL`,
 `LIVE_GPT_VOICE`, `LIVE_GPT_PROXY`, `LIVE_GPT_HEADERS`, `LIVE_GPT_DROP_GAP_S`, `LIVE_GPT_ZDR`.
+
+### Агент спрашивает хозяина, долгие просьбы
+
+Голосовой агент работает и с сайтами (браузер в песочнице, `handoff/browser-sandbox/`): заказать,
+забронировать, войти. Посреди дела ему бывает нужен хозяин: код из SMS, «да» перед оплатой, выбор.
+Для этого у моста есть вход для агента (`livebridge/surface.py`, `LIVE_SURFACE_LISTEN`, например
+`0.0.0.0:10702`, с токеном `LIVE_SURFACE_TOKEN`), а у Hermes — плагин `live/hermes-plugin/voice-surface`:
+
+- **Вопрос** (`POST /ask`, виды `code` / `confirm` / `text`) звучит в том Live-диалоге, который начал
+  эту сессию агента: каждую просьбу мост отправляет в сессии со своим именем (`X-Hermes-Session-Id:
+  live-…`, нужен `HERMES_KEY`). Ответ хозяина уходит только агенту: модель диалога его не видит, в
+  историю он не попадает. Код не пишется ни в лог, ни в дамп; агент тоже его не видит: Hermes вводит
+  цифры в страницу сам (`browser_vault_enter_code`). Число словами читается так, как диктуют коды
+  («сорок пять двенадцать» = 4512, `spoken.py`). «Да/нет» решается в пользу «нет»: любое «не»,
+  «стоп», «отмена» — отказ.
+- **Диалога уже нет** — мост отвечает `wake`: плагин будит колонки скриптом HA `script.live_reminder`
+  с текстом вопроса, и диалог, который откроется, примет ответ (как ответ на напоминание).
+- **Просьба, которую диалог бросил** (модель ответила сама, разговор оборвали) — её сессия «брошена»:
+  вопросы из неё получают `no_answer` сразу, никого не будят, итог не объявляется.
+- **Долгая просьба**: если агент не ответил за `LIVE_AGENT_DETACH_S` (20 с), колонка говорит «Это
+  надолго — занимаюсь, позову, если что-то понадобится», и просьба идёт в фоне. Пока диалог жив,
+  итог звучит в нём; когда диалог закончился, плагин после хода агента спрашивает мост (`POST
+  /result`) и объявляет итог через колонки. Объявляются только сессии, начатые Live-диалогом
+  (обычный конвейер HA свои ответы говорит сам).
+- Мост озвучивает только последнее сообщение агента (после последнего инструмента), без его
+  реплик между шагами.
+
+Плагин (кладётся в `~/.hermes/profiles/voice/plugins/voice-surface`, включается в
+`plugins.enabled` профиля, инструменты — набор `voice_surface` в `platform_toolsets.api_server`)
+делает это только в api_server-сессиях профиля `voice`: включает Hermes-у подсказки, которые в
+api_server выключены (код, подтверждение карты голосом: «Ввести карту … на сайте …? Да или нет?»),
+добавляет агенту инструмент `ask_owner` и объявление итогов. Токен моста — в
+`<профиль>/voice_surface.token`. Файл `<профиль>/voice_surface.nowake` выключает побудку колонок
+(вопросы без диалога тогда не задаются, итоги не объявляются) — для тестов и тихих часов.
+
+Пароли, карты и адреса — только из хранилища Hermes; плагин подключает весь Vaultwarden (CLI `bw`):
+`sudo hermes-bw-unlock` на сервере Hermes (`--login` — первый вход) спрашивает мастер-пароль и
+оставляет только ключ сессии в RAM (`/run/user/<uid>/hermes-bw/session`) до перезагрузки или
+`hermes-bw-lock`. Логины, карты (оплата) и личности с адресом видны агенту только по названию;
+вводятся в страницу без него. Карта и адрес вводятся только на сайтах из поля `hermes_sites` записи
+(origin через запятую, только https), карта — после «да» голосом.
 
 ### Тесты
 
