@@ -1,5 +1,6 @@
 """The home agent's two ways (agent.py) against a fake Home Assistant and a fake Hermes on loopback."""
 import asyncio
+import json
 
 import aiohttp
 import pytest
@@ -110,6 +111,34 @@ def test_hermes_directly(monkeypatch):
     assert asyncio.run(with_app(app, monkeypatch, scenario)) == "Сейчас 21:40."
     auth, body = seen[0]
     assert auth == "Bearer hk" and body["messages"] == [{"role": "user", "content": "@@LIVE@@ который час"}]
+
+
+def test_hermes_streamed_answer_is_what_follows_the_last_tool(monkeypatch):
+    def sse(*parts):
+        out = []
+        for p in parts:
+            if p.startswith("tool:"):
+                out.append('event: hermes.tool.progress\ndata: {"tool": "%s"}\n\n' % p[5:])
+            else:
+                out.append("data: " + json.dumps({"choices": [{"delta": {"content": p}}]}, ensure_ascii=False) + "\n\n")
+        return "".join(out) + "data: [DONE]\n\n"
+    bodies = [sse("I'll open Wikipedia.", "tool:browser_navigate", "Now Tomsk.", "tool:browser_navigate",
+                  "Омск — 1716, ", "Томск — 1604."),
+              sse("Готово.", "tool:memory")]               # nothing after the last tool: the last text it said
+
+    async def chat(req):
+        await req.json()
+        return web.Response(text=bodies.pop(0), content_type="text/event-stream",
+                            headers={"X-Hermes-Session-Id": "s1"})
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", chat)
+    sessions = []
+
+    async def scenario(http):
+        a = agent.Agent(http, {"agent": "hermes"})
+        return [await a.ask("x", on_session=sessions.append), await a.ask("y")]
+    assert asyncio.run(with_app(app, monkeypatch, scenario)) == ["Омск — 1716, Томск — 1604.", "Готово."]
+    assert sessions == ["s1"]
 
 
 def test_an_agent_that_cannot_work_is_refused_before_the_dialog(monkeypatch):

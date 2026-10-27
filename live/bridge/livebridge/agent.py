@@ -136,20 +136,26 @@ class Agent:
             if "event-stream" not in r.headers.get("Content-Type", ""):  # a server that answers in one piece
                 data = json.loads(await r.text())
                 return data["choices"][0]["message"].get("content") or ""
-            answer, event = "", ""
+            # The stream carries every assistant message of the turn; the answer is the one after the last tool
+            # (what the agent says between tool calls, "Now Tomsk.", is narration). An empty last message falls
+            # back to the last one with text.
+            answer, said, event = "", "", ""
             async for raw in r.content:
                 line = raw.decode("utf-8", "replace").strip()
                 if not line:
                     event = ""
                     continue
                 if line.startswith("event:"):
-                    event = line[6:].strip()  # hermes.tool.progress and friends: not part of the answer
+                    event = line[6:].strip()
                     continue
                 if not line.startswith("data:"):
                     continue
                 data = line[5:].strip()
                 if data == "[DONE]":
                     break
+                if event == "hermes.tool.progress":
+                    said, answer = (answer if answer.strip() else said), ""
+                    continue
                 if event and event != "message":
                     continue
                 try:
@@ -160,4 +166,4 @@ class Agent:
                     raise RuntimeError(f"hermes: {str(ev['error'])[:200]}")
                 for ch in ev.get("choices") or []:
                     answer += (ch.get("delta") or {}).get("content") or ""
-            return answer
+            return answer if answer.strip() else said

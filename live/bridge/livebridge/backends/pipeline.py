@@ -132,8 +132,11 @@ TOOLS = [
             "Ask the home agent (Hermes) to do or look up something. Use it for EVERYTHING that touches the "
             "real world or personal data: smart home control and device states (lights, switches, climate, "
             "vacuum, media), timers and reminders, calendar, money and spending, mail, weather, web "
-            "search, and the owner's remembered facts. Never claim an action happened unless this tool's answer "
-            "says so."),
+            "search, websites (it has a browser: orders, bookings, accounts) and the owner's remembered facts. "
+            "Never claim an action happened unless this tool's answer says so. Alongside the call say at most a "
+            "short filler ('Щас гляну.', 'Займусь.'): do not ask the owner the agent's questions yourself and do "
+            "not guess its answer; when the agent needs a choice, a confirmation or a code it asks the owner "
+            "itself."),
         "parameters": {"type": "object", "properties": {"request": {
             "type": "string",
             "description": "The full request in Russian, self-contained (resolve 'it', 'there', dates)."}},

@@ -15,6 +15,7 @@ the question as the text; the dialog that opens takes the answer.
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import os
@@ -38,7 +39,8 @@ def settings() -> dict:
     try:
         from hermes_cli.config import load_config_readonly
         cfg = load_config_readonly()
-    except Exception:
+    except Exception as e:
+        log.warning("voice-surface: reading the config failed, using the defaults: %r", e)
         cfg = {}
     entry = ((cfg.get("plugins") or {}).get("entries") or {}).get(PLUGIN_ID) or {}
     raw = entry.get("settings") if isinstance(entry, dict) else None
@@ -120,12 +122,18 @@ def _ha() -> tuple:
 
 
 def wake(text: str) -> bool:
-    """Make the speakers start a dialog that says `text` (Home Assistant script, field "message")."""
+    """Make the speakers start a dialog that says `text` (Home Assistant script, field "message"). Off while the
+    profile has a ``voice_surface.nowake`` file (tests, quiet hours): questions then fail instead of waking anyone."""
+    script = settings()["wake_script"].split(".", 1)[-1]
+    if (_home() / "voice_surface.nowake").exists():
+        log.info("voice-surface: not waking the speakers (script.%s, %d chars): %s/voice_surface.nowake is set",
+                 script, len(text), _home().name)
+        return False
     url, auth = _ha()
     if not url or not auth:
         log.warning("voice-surface: no Home Assistant address / token for this profile, cannot wake the speakers")
         return False
-    script = settings()["wake_script"].split(".", 1)[-1]
+    log.info("voice-surface: waking the speakers with script.%s (%d chars)", script, len(text))
     req = urllib.request.Request(f"{url}/api/services/script/{script}", method="POST",
                                  data=json.dumps({"message": text}).encode(),
                                  headers={"Authorization": auth, "Content-Type": "application/json"})
@@ -222,7 +230,8 @@ def post_llm_call(session_id: str = "", assistant_response: Any = "", platform: 
             return None
         if _bridge("POST", "/result", {"session": session_id, "text": text[:2000]}).get("announce"):
             log.info("voice-surface: the dialog of %s has ended; announcing its answer", session_id)
-            threading.Thread(target=wake, args=(text[:600],), daemon=True).start()
+            # the profile (Hermes home, config, secrets) is context-local: the thread runs in this turn's context
+            threading.Thread(target=contextvars.copy_context().run, args=(wake, text[:600]), daemon=True).start()
     except Exception as e:  # never break the turn
         log.warning("voice-surface: post_llm_call failed: %r", e)
     return None
