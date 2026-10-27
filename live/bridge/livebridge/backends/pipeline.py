@@ -260,6 +260,7 @@ class Dialog(Session):
         self.reply_jobs = set()  # sessions of the jobs it started
         self.turn_end = 0.0    # when the owner's last utterance ended
         self.cut = None        # {"user", "merge"}: the owner talked over this answer before hearing any of it
+        self.silent = None     # (the owner's turn, when) the model left without any answer (it was not finished?)
 
     async def open(self):
         if not OR_KEY:
@@ -628,10 +629,14 @@ class Dialog(Session):
                 elif pending is None:
                     self.spawn(stt.transcribe(self.http, pcm))  # only for the log
             cut, self.cut = self.cut, None
+            silent, self.silent = self.silent, None
             joined = cut is not None and cut["merge"] and any(m is cut["user"] for m in self.history)
+            if (cut is None and silent is not None and self.history and self.history[-1] is silent[0]
+                    and time.monotonic() - silent[1] <= 2 * MERGE_S):
+                cut, joined = {"user": silent[0], "merge": True}, True  # the model waited for the rest of it
             early = None
             if stt.mode() == "text" and text is not None and not stt.has_words(text):
-                if cut is None:
+                if cut is None or cut["user"] is (silent or (None,))[0]:
                     log.info("no words in the transcript, not answered")
                     self.turn_open = False
                     self.touch()
@@ -713,6 +718,8 @@ class Dialog(Session):
             await q.put(None)
             await self.tts_task
             self.carry = False
+            if self.reply_user is not None and self.history and self.history[-1] is self.reply_user:
+                self.silent = (self.reply_user, time.monotonic())
         except asyncio.CancelledError:
             raise
         except Exception as e:

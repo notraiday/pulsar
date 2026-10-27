@@ -30,10 +30,14 @@ RESCUE_MIN_MS = int(os.environ.get("LIVE_STT_RESCUE_MIN_MS", "96"))  # shorter "
 
 WORD_RE = re.compile(r"[^\W\d_]{2,}")
 # A transcript whose last word is one of these stops in the middle of a thought ("включи свет в", "купи хлеб и").
-# The recogniser ends every transcript with "." or "?", so the final period says nothing; "?" / "!" do end it.
-LEADS_ON = set("""и а но или либо что чтобы чтоб потому поэтому если когда где куда откуда как который которая которое
-которые чей в во на с со к ко по для у из от до за о об обо про при без над под через между перед после около ну э эм
-ээ эээ мм это этот эта эти так типа короче ещё еще также потом затем плюс минус не ни очень самый самая самое""".split())
+# The recogniser ends every transcript with "." or "?" (an unfinished phrase often sounds like a question: "Сколько
+# будет два +?"), so the final mark says little: prepositions, conjunctions and operators lead on whatever it is,
+# words that can end a question ("как?", "что?") only without "?" / "!".
+LEADS_ON = set("""и а но или либо чтобы чтоб потому поэтому если в во на с со к ко по для у из от до за о об обо про при
+без над под через между перед после около плюс минус умножить разделить очень не ни самый самая самое""".split())
+LEADS_ON_UNLESS_ASKED = set("""что когда где куда откуда как который которая которое которые чей ну э эм ээ эээ мм это
+этот эта эти так типа короче ещё еще также потом затем""".split())
+OPERATOR_END = ("+", "-", "−", "*", "×", "/", "=", ",", ":", ";", "—", "–", "…")
 
 
 def enabled() -> bool:
@@ -54,12 +58,16 @@ def has_words(text: str | None) -> bool:
 
 def leads_on(text: str | None) -> bool:
     t = (text or "").strip()
-    if not t or t.endswith(("?", "!")):
+    asked = t.endswith(("?", "!"))
+    core = t.rstrip(".?! ")
+    if not core:
         return False
-    if t.rstrip(".").endswith((",", ":", ";", "-", "—", "–", "…")) or t.endswith("..."):
+    if core.endswith(OPERATOR_END) or t.endswith("..."):
         return True
-    words = re.findall(r"[^\W\d_]+", t.lower())
-    return bool(words) and words[-1] in LEADS_ON
+    words = re.findall(r"[^\W\d_]+", core.lower())
+    if not words or not core.lower().endswith(words[-1]):
+        return False
+    return words[-1] in LEADS_ON or (not asked and words[-1] in LEADS_ON_UNLESS_ASKED)
 
 
 async def transcribe(http: aiohttp.ClientSession, pcm: bytes, quiet: bool = False) -> str | None:

@@ -136,3 +136,20 @@ def test_the_history_keeps_what_the_owner_heard_of_an_answer_they_talked_over(tm
     assert said.startswith("Раз") and said.endswith(pipeline.CUT_MARK)
     heard = said.removesuffix(pipeline.CUT_MARK)
     assert "десять" not in heard and "Одиннадцать" not in heard and "…" in heard
+
+
+def test_words_that_lead_on():
+    for t in ["Включи свет в.", "Купи хлеб и?", "Сколько будет два +?", "Поставь таймер на.", "Ну и что.", "Скажи,"]:
+        assert stt.leads_on(t), t
+    for t in ["Какая погода завтра?", "Нет.", "Как?", "Что?", "Сколько будет 2 + 2?", "Включи свет в спальне.", ""]:
+        assert not stt.leads_on(t), t
+
+
+def test_a_turn_the_model_left_unanswered_takes_the_next_utterance(tmp_path, monkeypatch, fake_vad):
+    # the model keeps silent on what sounds unfinished; the rest comes as a turn of its own: it joins the first
+    def reply(body):
+        return "[SILENT]" if users(body) == ["Сколько будет два."] else "Пять."
+    seen = run(tmp_path, monkeypatch, ["Сколько будет два.", "Плюс три."],
+               [(LOUDER, 12), (QUIET, 31), (LOUDER, 10), (QUIET, 25)], reply=reply)
+    assert users(seen["chat"][-1]) == ["Сколько будет два. Плюс три."]
+    assert seen["tts"] == ["Пять."]
