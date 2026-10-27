@@ -5,7 +5,7 @@ from typing import Any
 
 
 def register(ctx: Any) -> None:
-    from . import core, vaultwarden
+    from . import core, vaultwarden, voice_log
 
     core.install()
     vaultwarden.install()
@@ -20,6 +20,16 @@ def register(ctx: Any) -> None:
         is_async=False,
         description=core.ASK_OWNER_DESCRIPTION,
         emoji="🔔",
+    )
+    ctx.register_tool(
+        name="voice_log",
+        toolset="voice_surface",
+        schema={"name": "voice_log", "description": voice_log.TOOL_DESCRIPTION, "parameters": voice_log.TOOL_PARAMETERS},
+        handler=lambda args, **kw: voice_log.tool(core.settings, args, **kw),
+        check_fn=lambda: core._home().name == core.settings()["profile"],
+        is_async=False,
+        description=voice_log.TOOL_DESCRIPTION,
+        emoji="📓",
     )
 
 

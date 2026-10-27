@@ -10,6 +10,8 @@ can answer. In this profile's api_server sessions the Live bridge can, so:
   * after every turn the bridge is told the answer is ready (/result); when the Live dialog that asked has ended
     (the request went on in the background) and no other one is in progress, the bridge's short spoken summary of
     it is announced through Home Assistant (``wake_script``), and the dialog that opens goes on with that job;
+  * every voice turn worth remembering gets a line in the voice log in the vault, without personal details
+    (voice_log.py; the ``voice_log`` tool reads it);
   * website tasks and requests that went on in the background think: their model calls carry
     ``hermes_live_think``, which the model router in front of the agent turns into its thinking model
     (litellm-taint, ``cloud-think``) - except the step right after a browser action that worked (a click, typing:
@@ -55,9 +57,10 @@ def settings() -> dict:
         cfg = {}
     entry = ((cfg.get("plugins") or {}).get("entries") or {}).get(PLUGIN_ID) or {}
     raw = entry.get("settings") if isinstance(entry, dict) else None
-    out = {"bridge_url": "http://192.168.1.50:10702", "profile": "voice", "wake_script": "script.live_reminder"}
+    out = {"bridge_url": "http://192.168.1.50:10702", "profile": "voice", "wake_script": "script.live_reminder",
+           "log_dir": "/srv/vault/Агент/Голос"}
     if isinstance(raw, dict):
-        out.update({k: v for k, v in raw.items() if v})
+        out.update({k: v for k, v in raw.items() if v or k == "log_dir"})  # log_dir "" = no voice log
     return out
 
 
@@ -232,12 +235,16 @@ def install() -> None:
 
 # ---- after every turn: is anyone still listening for this answer? ----------------------------------------------
 
-def post_llm_call(session_id: str = "", assistant_response: Any = "", platform: str = "", **_: Any):
+def post_llm_call(session_id: str = "", assistant_response: Any = "", platform: str = "", user_message: Any = "",
+                  conversation_history: Any = None, **_: Any):
     try:
-        if platform != "api_server" or not _token() or _home().name != settings()["profile"]:
+        if platform != "api_server" or _home().name != settings()["profile"]:
             return None
         text = _TAG_RE.sub("", str(assistant_response or "")).strip()
-        if not session_id or not text:
+        if text:
+            from . import voice_log
+            voice_log.record(settings(), user_message, text, conversation_history or [])
+        if not session_id or not text or not _token():
             return None
         res = _bridge("POST", "/result", {"session": session_id, "text": text[:2000]}, timeout=15)
         if res.get("announce"):

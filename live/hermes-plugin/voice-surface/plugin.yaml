@@ -6,7 +6,8 @@ description: >-
   were refused. This routes them to the Live bridge (pulsar live/bridge, surface.py), which asks the owner through
   the speakers and returns only the parsed answer (a code is typed into the page by Hermes and never reaches the
   model). Also: the ask_owner tool, the Bitwarden session from hermes-bw-unlock (RAM only), Bitwarden cards and
-  identities as payment / address vault items, announcing answers of requests whose Live dialog has ended, and
+  identities as payment / address vault items, announcing answers of requests whose Live dialog has ended, a
+  voice log in the vault without personal details (the voice_log tool reads it), and
   (llm_request middleware) the router's thinking model for website tasks and requests that went on in the
   background, the fast one for the mechanical step after a browser action.
 author: local
@@ -23,7 +24,12 @@ config_schema:
     type: str
     default: "script.live_reminder"
     description: Home Assistant script that makes the speakers start a dialog with a text (field "message")
+  log_dir:
+    type: str
+    default: "/srv/vault/Агент/Голос"
+    description: Folder of the voice log (one Markdown file a day); "" turns it off
 hooks:
   - post_llm_call
 provides_tools:
   - ask_owner
+  - voice_log
