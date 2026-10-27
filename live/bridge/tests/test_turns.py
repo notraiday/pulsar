@@ -168,3 +168,26 @@ def test_short_noise_while_the_answer_is_made_leaves_it_alone(tmp_path, monkeypa
     seen = run(tmp_path, monkeypatch, ["Сколько будет два плюс два?", ""],
                [(LOUDER, 12), (QUIET, 30), (LOUDER, 8), (QUIET, 25)], think_s=2.0)
     assert len(seen["chat"]) == 1 and seen["tts"] == ["Хорошо."]
+
+
+def test_a_promptless_interruption_resumes_the_answer(tmp_path, monkeypatch, fake_vad):
+    answer = "Первое предложение раз. Второе предложение два. Третье предложение три."
+
+    def reply(body):
+        return answer if len(users(body)) == 1 else "Не должно быть."
+    # ask; the 3-sentence answer plays; the owner barges in ~mid-answer but says nothing (noise)
+    seen = run(tmp_path, monkeypatch, ["Расскажи что-нибудь.", ""],
+               [(LOUDER, 12), (QUIET, 55), (LOUDER, 20), (QUIET, 90)], reply=reply, tts_s=1.0)
+    assert len(seen["chat"]) == 1                       # no second model round — it resumed, not re-answered
+    assert "Третье предложение три." in seen["tts"]     # the tail after the cut was still spoken
+
+
+def test_a_lone_wake_word_over_the_answer_resumes_it(tmp_path, monkeypatch, fake_vad):
+    answer = "Альфа предложение раз. Бета предложение два. Гамма предложение три."
+
+    def reply(body):
+        return answer if len(users(body)) == 1 else "Не должно быть."
+    seen = run(tmp_path, monkeypatch, ["Расскажи что-нибудь.", "Алиса."],
+               [(LOUDER, 12), (QUIET, 55), (LOUDER, 20), (QUIET, 90)], reply=reply, tts_s=1.0)
+    assert len(seen["chat"]) == 1
+    assert "Гамма предложение три." in seen["tts"]

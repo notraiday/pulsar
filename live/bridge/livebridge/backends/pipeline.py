@@ -80,6 +80,8 @@ HEARD_LAG_S = float(os.environ.get("LIVE_HEARD_LAG_S", "0.3"))
 # The owner goes on talking this soon after the end of their turn, before any of the answer was heard: it is one turn
 # (the cut answer and its requests are dropped, the next utterance joins the turn).
 MERGE_S = float(os.environ.get("LIVE_MERGE_S", "2.5"))
+WAKE_RE = re.compile(r"^(алиса|алис|яндекс)[\s,.!?…]*$", re.I)  # a lone wake word is not a command
+WAKE_RE_LEAD = re.compile(r"^(алиса|алис|яндекс)[\s,.!?…]+", re.I)  # a stray wake word at the start of a turn
 _background: set = set()  # detached agent requests: they outlive their dialog
 _session_of: "weakref.WeakKeyDictionary[asyncio.Task, str]" = weakref.WeakKeyDictionary()  # agent request -> agent session
 ZDR_PROVIDER = {"zdr": True, "data_collection": "deny"}
@@ -261,6 +263,8 @@ class Dialog(Session):
         self.turn_end = 0.0    # when the owner's last utterance ended
         self.cut = None        # {"user", "merge"}: the owner talked over this answer before hearing any of it
         self.silent = None     # (the owner's turn, when) the model left without any answer (it was not finished?)
+        self.enq = []          # sentences of the answer put to the TTS, in order (for resuming after a bare cut)
+        self.resume = None     # {"left", "msgs", "full"}: the unplayed tail to resume if the cut carried no command
 
     async def open(self):
         if not OR_KEY:
@@ -525,6 +529,8 @@ class Dialog(Session):
         if flush and self.group is not None:
             self.group.cut_off(self)  # talked over the reminder: no more of it here
         active = self.resp is not None and not self.resp.done()
+        was_speaking = self.speaking
+        full = {id(m): (m.get("content") or "") for m in self.reply}  # before keep_heard truncates them
         heard = self.keep_heard() if flush else True
         if active and not heard and self.reply_user is not None:
             # an agent request that has already finished did something: it stays, and so does the turn as it was
@@ -539,7 +545,13 @@ class Dialog(Session):
                 self.orphan_pending()
         elif active:
             self.orphan_pending()
-        self.reply, self.segs = [], []
+        if flush and was_speaking:  # audio was still playing (the response task may have already finished queuing it)
+            until = time.monotonic() - HEARD_LAG_S
+            played = sum(1 for g in self.segs if g["start"] is not None and g["end"] <= until)
+            left = self.enq[played:]
+            if left:  # the owner cut in while it was talking: keep the tail in case nothing is actually said
+                self.resume = {"left": left, "msgs": list(self.reply), "full": full}
+        self.reply, self.segs, self.enq = [], [], []
         for t in (self.resp, self.tts_task):
             if t and not t.done():
                 t.cancel()
@@ -558,12 +570,51 @@ class Dialog(Session):
         self.resp = asyncio.create_task(self.respond((pcm, text, pending)))
 
     def on_noise(self):
-        if self.cut is not None and not self.turn_open and self.utt is None:
+        if self.turn_open or self.utt is not None:
+            return
+        if self.resume is not None:
+            log.info("the interruption carried no command: resuming the answer")
+            self.cut = None
+            self.turn_open = True
+            self.resp = asyncio.create_task(self._resume())
+        elif self.cut is not None:
             log.info("it was noise: the turn cut short is answered again")
             cut, self.cut = self.cut, None
             self.turn_open = True
             self.set_state("thinking")
             self.resp = asyncio.create_task(self.respond(again=cut["user"]))
+
+    async def _resume(self):
+        """Keep speaking the part of the answer the owner cut off, when the interruption turned out to carry no
+        command. Once it has all played, the history messages go back to their full text (the owner heard it whole)."""
+        resume, self.resume = self.resume, None
+        if resume is None:
+            self.turn_open = False
+            return
+        self.turn_open = True
+        self.touch()
+        q: asyncio.Queue = asyncio.Queue()
+        self.tts_task = asyncio.create_task(self.tts_worker(q))
+        self.reply, self.segs, self.enq = list(resume["msgs"]), [], []
+        try:
+            msg = resume["msgs"][-1] if resume["msgs"] else None
+            for sentence in resume["left"]:
+                await self.flush_sentences(sentence, q, final=True, msg=msg)
+            await q.put(None)
+            await self.tts_task
+            for m in resume["msgs"]:  # delivered in full now
+                whole = resume["full"].get(id(m))
+                if whole and any(x is m for x in self.history):
+                    m["content"] = whole
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("resume failed: %r", e)
+        finally:
+            self.turn_open = False
+            self.touch()
+            if not self.speaking and not self.ending:
+                self.set_state("listening")
 
     def keep_heard(self) -> bool:
         """The owner talked over the answer: its messages in the history become what they heard of it (the sentences
@@ -637,6 +688,7 @@ class Dialog(Session):
         follow-up of late results, or with `again` (the owner's turn) to answer a turn cut short once more."""
         if not self.speaking:
             self.reply, self.segs = [], []
+        self.enq = []
         self.reply_user, self.reply_jobs = again, set()
         self.jobs_before = surface.registry.jobs_made()
         if utt is not None:
@@ -654,6 +706,13 @@ class Dialog(Session):
                     and time.monotonic() - silent[1] <= 2 * MERGE_S):
                 cut, joined = {"user": silent[0], "merge": True}, True  # the model waited for the rest of it
             early = None
+            bare = text is not None and (not stt.has_words(text) or bool(WAKE_RE.match(text.strip())))
+            if self.resume is not None and bare:
+                # the owner cut in while it was talking but said no command (silence / just the wake word): go on
+                log.info("the interruption carried no command: resuming the answer")
+                self.turn_open = False
+                self.spawn(self._resume())
+                return
             if stt.mode() == "text" and text is not None and not stt.has_words(text):
                 if cut is None or cut["user"] is (silent or (None,))[0]:
                     log.info("no words in the transcript, not answered")
@@ -670,6 +729,9 @@ class Dialog(Session):
                 self.reply_user = cut["user"]
                 early = self.race(cut["user"]["content"])
             else:
+                if text:
+                    text = WAKE_RE_LEAD.sub("", text).strip() or text  # drop a stray leading "Алиса,"
+                self.resume = None
                 self.add_user_turn(pcm, text, forced)
                 self.reply_user = self.history[-1]
                 early = self.race(text)
@@ -928,11 +990,14 @@ class Dialog(Session):
                 s = clean_for_speech(m.group(1))
                 pending = pending[m.end():]
                 if re.search(r"\w", s):
+                    self.enq.append(s)
                     await q.put((msg, s))
                 continue
             break
         if final and re.search(r"\w", clean_for_speech(pending)):
-            await q.put((msg, clean_for_speech(pending)))
+            tail = clean_for_speech(pending)
+            self.enq.append(tail)
+            await q.put((msg, tail))
             pending = ""
         return pending
 
