@@ -38,7 +38,7 @@ import weakref
 
 from aiohttp import web
 
-from . import spoken
+from . import phrases, spoken
 from .util import clean_for_speech
 
 log = logging.getLogger("live")
@@ -47,8 +47,6 @@ LISTEN = os.environ.get("LIVE_SURFACE_LISTEN", "")      # e.g. 0.0.0.0:10702; ""
 TOKEN = os.environ.get("LIVE_SURFACE_TOKEN", "")
 ASK_TIMEOUT_S = float(os.environ.get("LIVE_ASK_TIMEOUT_S", "120"))
 KINDS = ("code", "confirm", "text")
-# Said before a background request's question in a dialog that did not start it.
-FOREIGN_LEAD = "По фоновой задаче: "
 
 _ids = itertools.count(1)
 
@@ -208,6 +206,19 @@ class Registry:
         job.attach(task)
         return job
 
+    def jobs_made(self) -> int:
+        return self._jobs_made
+
+    def forget(self, sessions):
+        """These sessions' jobs never happened (the answer that started them was dropped): stopped and gone."""
+        for session in sessions:
+            job = self.jobs.pop(session, None)
+            if job is not None and job.running:
+                job.task.cancel()
+            self.think.discard(session)
+            self.detached.discard(session)
+            self.runs.pop(session, None)
+
     def detach(self, session: str, task: asyncio.Task | None = None, request: str = ""):
         if not session:
             return
@@ -263,7 +274,7 @@ class Registry:
             a.resolve("no_answer")
         elif _live(own) and own.take_ask(a):
             log.info("ask %s (%s) in the live dialog of %s", a.id, kind, session)
-        elif (d := self.current()) is not None and d.take_ask(a, lead=FOREIGN_LEAD):
+        elif (d := self.current()) is not None and d.take_ask(a, lead=phrases.say("lead")):
             log.info("ask %s (%s) for %s in the Live dialog in progress (%s)", a.id, kind, session, d.st.peer)
         else:
             a.wake = True

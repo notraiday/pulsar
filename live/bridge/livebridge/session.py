@@ -28,6 +28,8 @@ VAD_ON = float(os.environ.get("LIVE_VAD_ON", "0.5"))     # speech probability th
 VAD_OFF = float(os.environ.get("LIVE_VAD_OFF", "0.35"))  # ... and inside one (hysteresis, bridges short pauses)
 VOICED_RATIO = float(os.environ.get("LIVE_VOICED_RATIO", "0.75"))  # share of voiced frames in the start/barge window
 END_SILENCE_MS = int(os.environ.get("LIVE_END_SILENCE_MS", "600"))
+# ... when the transcript made ahead stops on a word that leads on ("и", "что", "в"): the owner is mid-thought
+END_SILENCE_LONG_MS = int(os.environ.get("LIVE_END_SILENCE_LONG_MS", "1400"))
 START_MS = int(os.environ.get("LIVE_START_MS", "192"))
 BARGE_MS = int(os.environ.get("LIVE_BARGE_MS", "480"))   # speech needed to cut an answer that is playing or being made
 MIN_SPEECH_MS = int(os.environ.get("LIVE_MIN_SPEECH_MS", "320"))
@@ -65,7 +67,9 @@ class Session:
         self.vad_off = False            # another station of the group answers: hear nothing more
         self.http = None                # backends that have one set it (stt.py uses it)
         self.spec = None                # transcript of the utterance so far, started at its first pause (stt.py)
+        self.rest = None                # task deciding, from that transcript, when the pause ends the utterance
         self.bg: set = set()            # background tasks of the dialog (cancelled when it ends)
+        self.play_end = 0.0             # when the audio sent so far will have played (monotonic; 0 = nothing queued)
 
     # ---- hooks for backends ----
     async def open(self):
@@ -103,10 +107,14 @@ class Session:
     def start_followup(self):
         pass
 
+    def on_noise(self):
+        """What the turn detector took for the start of an utterance was noise (nothing goes to the backend)."""
+
     def cancel_response(self, flush: bool):
         """The owner spoke over the answer (flush: the station is to drop what it has queued)."""
         if flush:
             self.send(frame(b"F"))
+            self.play_end = 0.0
         self.speaking = False
         self.turn_open = False
 
@@ -120,6 +128,13 @@ class Session:
     # ---- station I/O ----
     def send(self, data: bytes):
         self.st.send(data)
+
+    def queued(self, pcm_bytes: int) -> tuple[float, float]:
+        """`pcm_bytes` of 24 kHz s16 answer audio go to the station now: (start, end) of their playback, estimated.
+        The station plays what it gets in order, at once when its queue is empty."""
+        start = max(time.monotonic(), self.play_end)
+        self.play_end = start + pcm_bytes / 48000
+        return start, self.play_end
 
     def set_state(self, s: str):
         if s != self.state:
@@ -239,6 +254,7 @@ class Session:
                     log.info("the owner answers over the question")
                     self.echo = [0, 0.0, 0.0, 0]
                     self.send(frame(b"F"))           # stop the question; the agent's work goes on
+                    self.play_end = 0.0
                     self.speaking = False
                 self.utt = self.pre[-(need + LEAD_FRAMES):]
                 self.voiced_in_utt = sum(recent)
@@ -259,28 +275,63 @@ class Session:
             if self.spec is not None:
                 self.spec.cancel()  # the owner goes on: that transcript is already short of the end
                 self.spec = None
+                self.forget_rest()
         else:
             self.silence += 1
             if (self.silence == max(1, stt.SPEC_MS // FRAME_MS) and self.spec is None and self.http is not None
                     and stt.needs_text()):
                 self.spec = self.spawn(stt.transcribe(self.http, b"".join(self.utt), quiet=self.secret_turn()))
-        if self.silence * FRAME_MS >= END_SILENCE_MS or len(self.utt) * FRAME_MS / 1000 > MAX_UTT_S:
-            utt, voiced_n = self.utt, self.voiced_in_utt
-            self.utt, self.pre, self.flags = None, [], []
-            spec, self.spec = self.spec, None
-            pcm = b"".join(utt)
-            if voiced_n * FRAME_MS < MIN_SPEECH_MS:
-                if stt.enabled() and self.http is not None and voiced_n * FRAME_MS >= stt.RESCUE_MIN_MS:
-                    self.spawn(self.rescue(pcm, voiced_n * FRAME_MS, spec))  # a short command, or noise?
-                    return
-                if spec is not None:
-                    spec.cancel()
-                log.info("ignored a short noise (%d ms voiced)", voiced_n * FRAME_MS)
-                self.dump("noise", pcm)
+        if len(self.utt) * FRAME_MS / 1000 > MAX_UTT_S:
+            self.end_utterance()
+        elif self.silence * FRAME_MS >= END_SILENCE_MS and self.rest is None:
+            if self.spec is None:
+                self.end_utterance()
+            else:  # the transcript made ahead decides how long the pause has to be
+                self.rest = self.spawn(self.wait_rest(self.utt, self.spec))
+
+    def end_utterance(self):
+        utt, voiced_n = self.utt, self.voiced_in_utt
+        self.utt, self.pre, self.flags = None, [], []
+        spec, self.spec = self.spec, None
+        self.forget_rest()
+        pcm = b"".join(utt)
+        if voiced_n * FRAME_MS < MIN_SPEECH_MS:
+            if stt.enabled() and self.http is not None and voiced_n * FRAME_MS >= stt.RESCUE_MIN_MS:
+                self.spawn(self.rescue(pcm, voiced_n * FRAME_MS, spec))  # a short command, or noise?
                 return
-            log.info("utterance %.1fs (%d ms voiced)", len(pcm) / 32000, voiced_n * FRAME_MS)
-            self.dump("utt", pcm)
-            self.on_utterance(pcm, None, spec)
+            if spec is not None:
+                spec.cancel()
+            log.info("ignored a short noise (%d ms voiced)", voiced_n * FRAME_MS)
+            self.dump("noise", pcm)
+            self.on_noise()
+            return
+        log.info("utterance %.1fs (%d ms voiced)", len(pcm) / 32000, voiced_n * FRAME_MS)
+        self.dump("utt", pcm)
+        self.on_utterance(pcm, None, spec)
+
+    def forget_rest(self):
+        if self.rest is not None and self.rest is not asyncio.current_task():
+            self.rest.cancel()
+        self.rest = None
+
+    async def wait_rest(self, utt: list, spec: asyncio.Task):
+        """END_SILENCE_MS of silence: the utterance ends, unless its transcript made ahead stops on a word that leads
+        on ("включи свет в", "купи хлеб и"): then the owner is mid-thought and gets up to END_SILENCE_LONG_MS. A turn
+        whose transcript is made ahead waits for it anyway (stt.needs_text), so waiting for it here costs nothing."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0, END_SILENCE_LONG_MS - END_SILENCE_MS) / 1000
+        try:
+            await asyncio.wait_for(asyncio.shield(spec), deadline - loop.time())
+        except (asyncio.TimeoutError, Exception):
+            pass
+        if self.utt is not utt or self.spec is not spec:
+            return  # the owner went on (or the utterance ended otherwise)
+        if spec.done() and not spec.cancelled() and spec.exception() is None and stt.leads_on(spec.result()):
+            log.info("the transcript so far leads on: waiting up to %d ms for the rest", END_SILENCE_LONG_MS)
+            await asyncio.sleep(max(0.0, deadline - loop.time()))
+            if self.utt is not utt or self.spec is not spec:
+                return
+        self.end_utterance()
 
     async def rescue(self, pcm: bytes, voiced_ms: int, spec=None):
         """Too short for the VAD: the local STT decides whether it was words ("удали их") or noise."""
@@ -293,6 +344,8 @@ class Session:
             log.info("ignored a short noise (%d ms voiced)%s", voiced_ms,
                      f", heard {text!r}" if text and not self.secret_turn() else "")
             self.dump("noise", pcm)
+            if not self.vad_off and not self.ending:
+                self.on_noise()
 
     def report_echo(self):
         """What the station's echo canceller leaves of our own voice in the mic stream (it feeds us the cleaned signal)."""

@@ -9,11 +9,12 @@ from aiohttp import web
 
 import bridge
 from conftest import LOUDER, QUIET, frames_until, serve_app, station
-from livebridge import agent, reminders, session, spoken, stt, surface, wire
+from livebridge import agent, phrases, reminders, session, spoken, stt, surface, wire
 from livebridge.backends import pipeline
 from livebridge.routes import Routes
 
 AUTH = {"Authorization": "Bearer surface-token"}
+DETACHED_REPLY = "Это подольше, займусь и скажу."   # the fake model's words when a request goes on in the background
 
 
 # ---- spoken answers ----
@@ -51,6 +52,8 @@ def fakes(seen, transcripts, hermes_delay=0.0, release=None, reply=None, model=N
             pass
         elif reply is not None:                    # the model answers by itself, without the agent
             ev = {"choices": [{"delta": {"content": reply}}]}
+        elif msgs[-1].get("role") == "tool" and msgs[-1]["content"] == pipeline.DETACHED_NOTE:
+            ev = {"choices": [{"delta": {"content": DETACHED_REPLY}}]}
         elif any("Ты закончила дело" in str(m.get("content")) for m in msgs):
             ev = {"choices": [{"delta": {"content": "Заказ оформлен."}}]}
         elif any(m.get("role") == "tool" for m in msgs[-2:]):
@@ -212,7 +215,7 @@ def test_a_code_the_agent_asks_for_goes_to_it_alone(tmp_path, monkeypatch, fake_
     ask, answer, chats, got = asyncio.run(go())
     assert ask["wake"] is False
     assert answer == {"status": "answered", "answer": "4512"}
-    assert seen["tts"][:2] == ["Скажи код из SMS.", pipeline.ACKS["code"]]
+    assert seen["tts"][0] == "Скажи код из SMS." and seen["tts"][1] in phrases.POOLS["ack_code"]
     assert seen["tts"][-1] == "Готово, заказ оформлен."
     assert chats == 1                              # no model round for the code
     assert "4512" not in caplog.text and "четыре" not in caplog.text
@@ -255,7 +258,7 @@ def test_a_long_request_goes_on_in_the_background_and_is_told_later(tmp_path, mo
             await s_runner.cleanup()
             return alive, gone, unauthorized, unknown, got
     alive, gone, unauthorized, unknown, got = asyncio.run(go())
-    assert seen["tts"] == [pipeline.DETACHED_SPEECH, "Заказ оформлен."]   # told once: not again when it returns
+    assert seen["tts"] == [DETACHED_REPLY, "Заказ оформлен."]   # told once: not again when it returns
     assert alive == {"announce": False} and gone == {"announce": False} and unauthorized == 401
     assert unknown == {"announce": False}          # a session no Live dialog started (HA's own pipeline)
     assert len(seen["hermes"]) == 1                # one request: the early one, detached
@@ -338,8 +341,8 @@ def test_the_owner_steers_a_running_website_task_from_another_dialog(tmp_path, m
     assert flags == {"background": True, "think": True}
     assert seen["steers"] == ["Лучше пепперони."]
     assert len(seen["hermes"]) == 1                # no second run: the dialog decided, no early request
-    assert seen["tts"][:3] == [pipeline.DETACHED_SPEECH, "Хорошо, возьму пепперони.", "Заказ оформлен."]
-    steer_round = next(i for i, b in enumerate(seen["chat"]) if "Твои дела" in b["messages"][0]["content"])
+    assert seen["tts"][:3] == [DETACHED_REPLY, "Хорошо, возьму пепперони.", "Заказ оформлен."]
+    steer_round = next(i for i, b in enumerate(seen["chat"]) if b["messages"][-1].get("content") == "Лучше пепперони.")
     assert "Учла: Лучше пепперони." in seen["chat"][steer_round + 1]["messages"][-1]["content"]  # no round between
     assert "Задачи агента" not in str(seen["chat"]) and "передал" not in str(seen["tts"]).lower()
     assert got[-1] == (b"X", b"idle")
@@ -535,8 +538,9 @@ def test_a_background_request_asks_and_answers_in_the_dialog_in_progress(tmp_pat
     assert bg == {"background": True, "think": False}
     assert ask["wake"] is False and answer == {"status": "answered", "answer": "Синий."}
     assert result == {"announce": False}
-    assert seen["tts"][:4] == [pipeline.DETACHED_SPEECH, surface.FOREIGN_LEAD + "Какой цвет коробки?",
-                               pipeline.ACKS["text"], "Заказ оформлен."]
+    assert seen["tts"][0] == DETACHED_REPLY and seen["tts"][3] == "Заказ оформлен."
+    assert any(seen["tts"][1] == lead + "Какой цвет коробки?" for lead in phrases.POOLS["lead"])
+    assert seen["tts"][2] in phrases.POOLS["ack_text"]
     note = seen["chat"][-1]["messages"][-1]["content"]
     assert "Ты закончила дело «сделай». Итог: Заказ оформлен, привезут к восьми." in note
     assert got[-1] == (b"X", b"idle")
@@ -620,6 +624,7 @@ def test_with_no_dialog_the_speakers_are_woken_and_the_loudest_answers(tmp_path,
     ask, answer, got = asyncio.run(go())
     assert ask["wake"] is True
     assert answer == {"status": "answered", "answer": "yes"}
-    assert seen["tts"] == ["Оплатить заказ?", pipeline.ACKS["yes"]]
+    assert seen["tts"][0] == "Оплатить заказ?" and seen["tts"][1:] and seen["tts"][1] in phrases.POOLS["ack_yes"]
+    assert len(seen["tts"]) == 2
     assert seen["chat"] == [] and seen["hermes"] == []   # nothing went to a model or the agent
     assert got[-1] == (b"X", b"answered")

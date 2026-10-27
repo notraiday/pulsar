@@ -5,7 +5,7 @@ import wave
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent  # live/bridge/
-TAG_RE = re.compile(r"\[(?:emo:[a-z]+|SILENT)\]", re.I)
+TAG_RE = re.compile(r"\[(?:emo:[a-z]+|SILENT|тут хозяин тебя перебил)\]", re.I)  # never spoken
 
 # Zero data retention: what the bridge sends to the cloud goes only to endpoints that keep none of it (OpenRouter's
 # provider.zdr; backends that cannot promise that refuse to run). LIVE_ZDR=0 lifts it.

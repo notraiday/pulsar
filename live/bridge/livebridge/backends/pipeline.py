@@ -4,7 +4,8 @@ TTS model) with the home agent behind the ask_hermes tool (through Home Assistan
 The VAD in Session does the turn-taking: it finds the end of an utterance, which goes to the chat model as audio;
 the reply text is cut into sentences and each sentence is synthesised and streamed to the station while the model
 keeps writing. Speech over the answer cancels all of it (barge-in); tool calls keep running through a barge-in and
-their results are spoken later. The dialog ends when the model calls end_dialog (at once: no further model round,
+their results are spoken later. The history keeps what the owner heard of a cut answer (keep_heard); an owner who
+goes on with their turn before hearing any of the answer is one turn (MERGE_S, drop_reply). The dialog ends when the model calls end_dialog (at once: no further model round,
 only what it said alongside is played out), after IDLE_S of silence once the
 answer has played, or when the station ends it.
 
@@ -39,7 +40,7 @@ from pathlib import Path
 
 import aiohttp
 
-from .. import reminders, stt, surface
+from .. import phrases, reminders, stt, surface
 from ..agent import Agent
 from ..session import Session
 from ..util import TAG_RE, ZDR, BackendUnavailable, HERE, clean_for_speech, read_instructions, wav16k
@@ -68,11 +69,17 @@ TTS_HEDGE_S = float(os.environ.get("LIVE_TTS_HEDGE_S", "0.8"))  # no audio after
 AGENT_RACE = os.environ.get("LIVE_AGENT_RACE", "1") != "0"  # first turn: the agent is asked with the transcript at once
 DETACH_S = float(os.environ.get("LIVE_AGENT_DETACH_S", "20"))  # an agent request still running this long goes on in the background (0 = never)
 DETACHED_NOTE = ("Это дело идёт дальше в фоне: если понадобится код или подтверждение, ты спросишь хозяина сама, итог "
-                 "скажешь, когда закончишь.")
-DETACHED_SPEECH = "Это надолго — занимаюсь, позову, если что-то понадобится."
+                 "скажешь, когда закончишь. Скажи ему об этом коротко, своими словами, одной фразой (не теми же, что "
+                 "в прошлый раз).")
 STEERED_NOTE = ("Принято в идущее дело: ты учтёшь это после текущего шага, итог скажешь, когда закончишь. Если хозяину "
                 "ещё ничего не ответила — коротко подтверди от себя («Хорошо, добавлю»).")
-ACKS = {"code": "Принято, ввожу.", "yes": "Хорошо.", "no": "Поняла, не делаю.", "text": "Поняла."}
+# The owner talked over the answer: the history keeps what they heard of it, marked so. HEARD_LAG_S: the station's
+# playback lag and the owner's first words over the answer (they hear little of what plays as they start talking).
+CUT_MARK = "[тут хозяин тебя перебил]"
+HEARD_LAG_S = float(os.environ.get("LIVE_HEARD_LAG_S", "0.3"))
+# The owner goes on talking this soon after the end of their turn, before any of the answer was heard: it is one turn
+# (the cut answer and its requests are dropped, the next utterance joins the turn).
+MERGE_S = float(os.environ.get("LIVE_MERGE_S", "2.5"))
 _background: set = set()  # detached agent requests: they outlive their dialog
 _session_of: "weakref.WeakKeyDictionary[asyncio.Task, str]" = weakref.WeakKeyDictionary()  # agent request -> agent session
 ZDR_PROVIDER = {"zdr": True, "data_collection": "deny"}
@@ -200,6 +207,10 @@ def _args(call) -> dict:
     return a if isinstance(a, dict) else {}
 
 
+def _letters(s: str) -> str:
+    return re.sub(r"\W+", "", s.lower())
+
+
 def tts_body(text: str, voice: str = "") -> dict:
     body = {"model": TTS, "input": text, "voice": voice or TTS_VOICE, "response_format": "pcm"}
     if TTS_SPEED != 1.0:
@@ -242,6 +253,13 @@ class Dialog(Session):
         self.round_said = False  # the last model round said something (not only tool calls)
         self.job_no = 0        # the job this dialog is about (its announcement opened it, or the owner went back to it)
         self.woken = False     # the house opened this dialog to ask the owner something (surface.py)
+        self.reply = []        # the assistant messages of the answer being made / played, in order
+        self.segs = []         # its sentences sent to the TTS: {msg, text, start, end} (playback, estimated)
+        self.reply_user = None # the owner's turn it answers (None: a follow-up of late results)
+        self.jobs_before = 0   # surface.Registry job count when it started (its own jobs come after)
+        self.reply_jobs = set()  # sessions of the jobs it started
+        self.turn_end = 0.0    # when the owner's last utterance ended
+        self.cut = None        # {"user", "merge"}: the owner talked over this answer before hearing any of it
 
     async def open(self):
         if not OR_KEY:
@@ -351,6 +369,7 @@ class Dialog(Session):
 
     async def say(self, text: str):
         async for pcm in self.tts_chunks(text):
+            self.queued(len(pcm))
             self.speaking = True
             self.touch()
             self.set_state("speaking")
@@ -368,12 +387,12 @@ class Dialog(Session):
         if status == "unclear" and a.tries < 1:
             a.tries += 1
             log.info("ask %s: answer unclear, asking again", a.id)
-            await self.pose(a, "Не расслышала. ")
+            await self.pose(a, phrases.say("again"))
             return
         a.resolve(status, value)
         log.info("ask %s answered: %s", a.id, status if a.secret else f"{status} {value[:80]!r}")
         self.next_question()
-        ack = ACKS.get(value if a.kind == "confirm" else a.kind, "") if status == "answered" else "Не поняла, пропускаю."
+        ack = phrases.ack(a.kind, value) if status == "answered" else phrases.say("skip")
         if ack:
             await self.say(ack)
         if self.questions:
@@ -486,8 +505,21 @@ class Dialog(Session):
     def cancel_response(self, flush: bool):
         if flush and self.group is not None:
             self.group.cut_off(self)  # talked over the reminder: no more of it here
-        if self.resp and not self.resp.done():
+        active = self.resp is not None and not self.resp.done()
+        heard = self.keep_heard() if flush else True
+        if active and not heard and self.reply_user is not None:
+            # an agent request that has already finished did something: it stays, and so does the turn as it was
+            done = any(self.tools.get(tc["id"]) is None or self.tools[tc["id"]].done()
+                       for m in self.reply for tc in m.get("tool_calls") or [])
+            merge = time.monotonic() - self.turn_end <= MERGE_S and not done
+            self.cut = {"user": self.reply_user, "merge": merge}
+            if merge:
+                self.drop_reply()
+            else:
+                self.orphan_pending()
+        elif active:
             self.orphan_pending()
+        self.reply, self.segs = [], []
         for t in (self.resp, self.tts_task):
             if t and not t.done():
                 t.cancel()
@@ -500,9 +532,67 @@ class Dialog(Session):
         """`text`: a transcript already made (a short utterance the STT kept: it always goes to the model);
         `pending`: the transcript being made ahead (stt.py)."""
         self.cancel_response(flush=False)
+        self.turn_end = time.monotonic()
         self.turn_open = True
         self.set_state("thinking")
         self.resp = asyncio.create_task(self.respond((pcm, text, pending)))
+
+    def on_noise(self):
+        if self.cut is not None and not self.turn_open and self.utt is None:
+            log.info("it was noise: the turn cut short is answered again")
+            cut, self.cut = self.cut, None
+            self.turn_open = True
+            self.set_state("thinking")
+            self.resp = asyncio.create_task(self.respond(again=cut["user"]))
+
+    def keep_heard(self) -> bool:
+        """The owner talked over the answer: its messages in the history become what they heard of it (the sentences
+        played to the end, the cut one up to the share of its words played) with CUT_MARK. Whether they heard any."""
+        until = time.monotonic() - HEARD_LAG_S
+        heard_any = False
+        for msg in self.reply:
+            parts, whole = [], True
+            for g in (g for g in self.segs if g["msg"] is msg):
+                if g["start"] is not None and g["end"] <= until:
+                    parts.append(g["text"])
+                    continue
+                whole = False
+                if g["start"] is not None and g["start"] < until:
+                    words = g["text"].split()
+                    k = int(len(words) * (until - g["start"]) / max(g["end"] - g["start"], 0.05))
+                    if k:
+                        parts.append(" ".join(words[:k]).rstrip(",;:—–-") + "…")
+                break
+            heard = " ".join(parts)
+            heard_any = heard_any or bool(heard)
+            in_history = any(m is msg for m in self.history)
+            if in_history and whole and _letters(heard) == _letters(msg.get("content") or ""):
+                continue  # played to the end
+            log.info("the owner heard %s", f"{len(heard)} of {len(msg.get('content') or '')} chars" if heard
+                     else "none of it")
+            new = f"{heard} {CUT_MARK}" if heard else None
+            if in_history:
+                msg["content"] = new
+                if new is None and not msg.get("tool_calls"):
+                    self.history[:] = [m for m in self.history if m is not msg]
+            elif new:  # cut while the model was still writing it
+                msg["content"] = new
+                self.history.append(msg)
+        return heard_any
+
+    def drop_reply(self):
+        """The owner went on with their turn before hearing any of the answer: the answer goes (its requests are
+        stopped, its new jobs forgotten) and the next utterance joins the turn (respond)."""
+        ids = {tc["id"] for m in self.reply for tc in m.get("tool_calls") or []}
+        for cid in ids:
+            t = self.tools.pop(cid, None)
+            if t is not None and not t.done():
+                t.cancel()
+            self.asked.pop(cid, None)
+        surface.registry.forget(self.reply_jobs)
+        self.history[:] = [m for m in self.history
+                           if not any(m is r for r in self.reply) and m.get("tool_call_id") not in ids]
+        log.info("the owner goes on with the turn: the answer begun is dropped (%d requests stopped)", len(ids))
 
     def add_user_turn(self, pcm: bytes, text: str | None, forced: bool):
         """LIVE_INPUT=text: the transcript alone (the sound when there is none: the STT failed); both: the transcript
@@ -522,9 +612,13 @@ class Dialog(Session):
         while self.history and self.history[0].get("role") != "user":
             self.history.pop(0)  # never start with a tool result whose call was trimmed away
 
-    async def respond(self, utt=None):
+    async def respond(self, utt=None, again=None):
         """`utt`: (pcm, transcript or None, task making it or None) of the utterance this answers; None for a
-        follow-up of late results."""
+        follow-up of late results, or with `again` (the owner's turn) to answer a turn cut short once more."""
+        if not self.speaking:
+            self.reply, self.segs = [], []
+        self.reply_user, self.reply_jobs = again, set()
+        self.jobs_before = surface.registry.jobs_made()
         if utt is not None:
             pcm, text, pending = utt
             forced = text is not None
@@ -533,15 +627,28 @@ class Dialog(Session):
                     text = await pending if pending is not None else await stt.transcribe(self.http, pcm)
                 elif pending is None:
                     self.spawn(stt.transcribe(self.http, pcm))  # only for the log
+            cut, self.cut = self.cut, None
+            joined = cut is not None and cut["merge"] and any(m is cut["user"] for m in self.history)
+            early = None
             if stt.mode() == "text" and text is not None and not stt.has_words(text):
-                log.info("no words in the transcript, not answered")
-                self.turn_open = False
-                self.touch()
-                if not self.speaking and not self.ending:
-                    self.set_state("listening")
-                return
-            self.add_user_turn(pcm, text, forced)
-            early = self.race(text)
+                if cut is None:
+                    log.info("no words in the transcript, not answered")
+                    self.turn_open = False
+                    self.touch()
+                    if not self.speaking and not self.ending:
+                        self.set_state("listening")
+                    return
+                log.info("no words in the transcript: the turn cut short is answered again")
+                self.reply_user = cut["user"]
+            elif joined and stt.mode() == "text" and text and isinstance(cut["user"].get("content"), str):
+                cut["user"]["content"] = f"{cut['user']['content'].rstrip()} {text.strip()}"
+                log.info("the utterance goes on the owner's turn: %r", cut["user"]["content"][:200])
+                self.reply_user = cut["user"]
+                early = self.race(cut["user"]["content"])
+            else:
+                self.add_user_turn(pcm, text, forced)
+                self.reply_user = self.history[-1]
+                early = self.race(text)
         else:
             early = None
         q: asyncio.Queue = asyncio.Queue()
@@ -598,8 +705,10 @@ class Dialog(Session):
                 direct = self.direct_answer(calls, results)
                 if direct:
                     log.info("direct answer from the agent (%d chars), no second model round", len(direct))
-                    self.history.append({"role": "assistant", "content": direct})
-                    await self.flush_sentences(direct, q, final=True)
+                    msg = {"role": "assistant", "content": direct}
+                    self.history.append(msg)
+                    self.reply.append(msg)
+                    await self.flush_sentences(direct, q, final=True, msg=msg)
                     break
             await q.put(None)
             await self.tts_task
@@ -635,9 +744,10 @@ class Dialog(Session):
                 or self.has_unspoken_results()):  # an earlier interrupted request is ready: let the model say both
             return ""
         if results[0] == DETACHED_NOTE:
-            return DETACHED_SPEECH
+            return ""  # the model says it in its own words
         text = clean_for_speech(results[0])
-        if not text or len(text) > DIRECT_MAX or text.startswith(("Агент не ответил", "Сделано, ответ пустой")):
+        if not text or len(text) > DIRECT_MAX or text.startswith(("Агент не ответил", "Сделано, ответ пустой",
+                                                                   "Агент остановлен")):
             return ""
         return text
 
@@ -746,6 +856,8 @@ class Dialog(Session):
         headers = or_headers()
         t0 = time.monotonic()
         text, pending, calls, first, tool_seen = "", "", {}, True, False
+        msg = {"role": "assistant", "content": None}  # filled in at the end; its sentences are played meanwhile
+        self.reply.append(msg)
         async for ev in self.llm_events(body, headers):
             if ev.get("error"):
                 raise RuntimeError(f"openrouter: {str(ev['error'])[:300]}")
@@ -757,7 +869,7 @@ class Dialog(Session):
                         log.info("first text after %.2fs", time.monotonic() - t0)
                     text += d["content"]
                     pending += d["content"]
-                    pending = await self.flush_sentences(pending, q, final=False)
+                    pending = await self.flush_sentences(pending, q, final=False, msg=msg)
                 for tc in d.get("tool_calls") or []:
                     c = calls.setdefault(tc.get("index", 0), {"id": "", "name": "", "args": ""})
                     c["id"] = tc.get("id") or c["id"]
@@ -767,9 +879,9 @@ class Dialog(Session):
                     if c["name"] and not tool_seen:
                         tool_seen = True
                         log.info("tool call %s after %.2fs", c["name"], time.monotonic() - t0)
-        await self.flush_sentences(pending, q, final=True)
+        await self.flush_sentences(pending, q, final=True, msg=msg)
         calls_l = [dict(c, id=c["id"] or f"call_{i}") for i, c in sorted(calls.items())]
-        msg = {"role": "assistant", "content": clean_for_speech(text) or None}
+        msg["content"] = clean_for_speech(text) or None
         if calls_l:
             msg["tool_calls"] = [{"id": c["id"], "type": "function",
                                   "function": {"name": c["name"], "arguments": c["args"] or "{}"}} for c in calls_l]
@@ -780,7 +892,9 @@ class Dialog(Session):
         self.round_said = bool(msg["content"])
         return calls_l
 
-    async def flush_sentences(self, pending: str, q: asyncio.Queue, final: bool) -> str:
+    async def flush_sentences(self, pending: str, q: asyncio.Queue, final: bool, msg=None) -> str:
+        """Complete sentences of `pending` go to the TTS queue (with the assistant message they belong to); the rest
+        is returned."""
         while True:
             m = SENT_RE.match(pending)
             if m and (final or m.end() < len(pending) or pending.rstrip().endswith(("!", "?", "…"))
@@ -788,11 +902,11 @@ class Dialog(Session):
                 s = clean_for_speech(m.group(1))
                 pending = pending[m.end():]
                 if re.search(r"\w", s):
-                    await q.put(s)
+                    await q.put((msg, s))
                 continue
             break
         if final and re.search(r"\w", clean_for_speech(pending)):
-            await q.put(clean_for_speech(pending))
+            await q.put((msg, clean_for_speech(pending)))
             pending = ""
         return pending
 
@@ -861,10 +975,16 @@ class Dialog(Session):
 
     async def tts_worker(self, q: asyncio.Queue):
         while True:
-            s = await q.get()
-            if s is None:
+            item = await q.get()
+            if item is None:
                 return
+            msg, s = item
+            seg = {"msg": msg, "text": s, "start": None, "end": None}
+            self.segs.append(seg)
             async for pcm in self.tts_chunks(s):
+                start, seg["end"] = self.queued(len(pcm))
+                if seg["start"] is None:
+                    seg["start"] = start
                 self.speaking = True
                 self.touch()
                 self.set_state("speaking")
@@ -933,7 +1053,9 @@ class Dialog(Session):
         and it is one of the owner's jobs (they may come back to it)."""
         if sid:
             surface.registry.think.add(sid)
-            surface.registry.track(sid, request, task)
+            job = surface.registry.track(sid, request, task)
+            if job is not None and job.no > self.jobs_before:
+                self.reply_jobs.add(sid)
 
     async def continue_job(self, no, request: str, browser: bool) -> str:
         """The owner's words about one of the agent's jobs: a running one gets them on the way (steer), a finished
