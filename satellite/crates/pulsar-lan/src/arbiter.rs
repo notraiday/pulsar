@@ -24,8 +24,13 @@ use crate::errstr;
 /// Spotter confirmations of one utterance on stations a few metres apart land within ~100 ms of
 /// each other; the window adds Wi-Fi latency on top. It delays the earcon by as much.
 const WINDOW_MS: i64 = 250;
-/// A peer may confirm (and claim) before we do.
-const LOOKBACK_MS: i64 = 500;
+/// How far back a peer's claim for the same wake word still counts when we confirm. It must cover
+/// the spread in when different models confirm the *same* utterance: a Midi (libyandex_evil, fires
+/// on the VAD-confirmed event 5) lands close to a second after a Mini 3 (split libs, keyword event
+/// 2). Too short and the late station discards the earlier claim and answers too — both reply.
+/// Capped well under KEEP_MS so the claim is still retained. The cost is that a genuinely separate
+/// wake on another station within this long of a peer's claim is suppressed, which is rare.
+const LOOKBACK_MS: i64 = 1500;
 /// Broadcast over Wi-Fi is sent at a basic rate without ACKs or retries.
 const RESEND_MS: i64 = 40;
 const COPIES: i32 = 3;

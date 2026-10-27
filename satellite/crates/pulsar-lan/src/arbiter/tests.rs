@@ -290,11 +290,25 @@ async fn lookback_and_wake_word_select_the_peers() {
 
     let mut r = Rig::new("st-me");
     r.peer("st-b", "alisa", false, -30.0);
-    r.run_for(501).await;
+    r.run_for(1501).await;
     r.claim(1, -10.0, false, true);
     r.peer("st-c", "yandex", true, -1.0);
     r.run_for(250).await;
     assert_eq!(r.decided(), Some((1, true, "st-me".into(), 0)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_that_confirmed_about_a_second_earlier_still_wins() {
+    // Cross-model skew: a Mini 3 (keyword event 2) confirms the wake word ~1 s before a Midi
+    // (VAD-confirmed event 5) does on the SAME utterance. The later station must still see the
+    // Mini's claim and yield; with too short a look-back it would think it was alone and both
+    // would answer.
+    let mut r = Rig::new("st-midi");
+    r.peer("st-mini", "alisa", false, -55.0);
+    r.run_for(1000).await;
+    r.claim(1, -63.0, false, true); // fainter and ~1 s later, as the far station
+    r.run_for(250).await;
+    assert_eq!(r.decided(), Some((1, false, "st-mini".into(), 1)));
 }
 
 #[tokio::test(start_paused = true)]
