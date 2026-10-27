@@ -289,39 +289,107 @@ def _routine(messages) -> bool:
     return True
 
 
+def _thinks(session_id: str, messages) -> bool:
+    if session_id not in _think:
+        if not _token():
+            return False
+        if _browser_used(messages):
+            why = "the agent uses the browser"
+        else:
+            st = _bridge("GET", f"/session/{session_id}", timeout=0.5)
+            why = "a website task" if st.get("think") else "in the background" if st.get("background") else ""
+        if not why:
+            return False
+        if len(_think) > 1000:
+            _think.clear()
+            _streak.clear()
+        _think.add(session_id)
+        log.info("voice-surface: %s thinks from now on (%s)", session_id, why)
+    if _routine(messages) and _streak.get(session_id, 0) < SYSTEM1_MAX:
+        _streak[session_id] = _streak.get(session_id, 0) + 1
+        return False
+    _streak[session_id] = 0
+    return True
+
+
 def llm_request(request: Any = None, session_id: str = "", platform: str = "", **_: Any):
     """``llm_request`` middleware for the Live bridge's sessions: website tasks (the dialog model said so, or the
     agent has used the browser) and requests that went on in the background (nobody waits) ask the router for the
-    thinking model, but for the mechanical step after a browser action."""
+    thinking model, but for the mechanical step after a browser action; page views older than the newest ones go
+    to the model as a short summary."""
     try:
         if platform != "api_server" or not str(session_id).startswith("live-") or not isinstance(request, dict):
             return None
-        messages = request.get("messages") or []
-        if session_id not in _think:
-            if _home().name != settings()["profile"] or not _token():
-                return None
-            if _browser_used(messages):
-                why = "the agent uses the browser"
-            else:
-                st = _bridge("GET", f"/session/{session_id}", timeout=0.5)
-                why = "a website task" if st.get("think") else "in the background" if st.get("background") else ""
-            if not why:
-                return None
-            if len(_think) > 1000:
-                _think.clear()
-                _streak.clear()
-            _think.add(session_id)
-            log.info("voice-surface: %s thinks from now on (%s)", session_id, why)
-        if _routine(messages) and _streak.get(session_id, 0) < SYSTEM1_MAX:
-            _streak[session_id] = _streak.get(session_id, 0) + 1
+        if _home().name != settings()["profile"]:
             return None
-        _streak[session_id] = 0
+        messages = request.get("messages") or []
+        think = _thinks(session_id, messages)
+        slim = _slim_page_views(messages)
+        if not think and slim is None:
+            return None
         req = dict(request)
-        req["extra_body"] = dict(req.get("extra_body") or {}, **{THINK_FIELD: True})
-        return {"request": req, "source": PLUGIN_ID, "reason": "Live request that thinks"}
+        if slim is not None:
+            req["messages"] = slim
+        if think:
+            req["extra_body"] = dict(req.get("extra_body") or {}, **{THINK_FIELD: True})
+        reason = " and ".join(r for r, on in (("thinks", think), ("older page views summarised", slim is not None)) if on)
+        return {"request": req, "source": PLUGIN_ID, "reason": f"Live request: {reason}"}
     except Exception as e:  # never break the call
         log.debug("voice-surface: llm_request: %r", e)
         return None
+
+
+# ---- older page views go to the model as a summary ----------------------------------------------------------------
+# Every snapshot is a few thousand tokens of page tree. Kept whole, a browser job crossed the compression threshold
+# after ~20 steps and the agent lost the thread in each compression. Only the request is changed: the session keeps
+# every result. Summaries are deterministic, so the cached prompt prefix before them stays valid.
+
+PAGE_VIEWS_KEPT = 2        # the newest page views stay whole (the current page and the one before the last action)
+PAGE_VIEW_MIN = 2000       # chars; a smaller result is left as it is
+_WRAPPED = re.compile(r'(<untrusted_tool_result source="(browser_[a-z_]+)">.*?\n\n)(\{.*\})(\s*</untrusted_tool_result>\s*)$', re.S)
+_HEADING = re.compile(r'- (?:heading|dialog|alertdialog) "([^"]{2,120})"')
+
+
+def _page_view(content) -> Optional[re.Match]:
+    if not isinstance(content, str) or len(content) < PAGE_VIEW_MIN or '"snapshot": "' not in content:
+        return None
+    return _WRAPPED.search(content)
+
+
+def _page_summary(match: re.Match) -> str:
+    try:
+        data = json.loads(match.group(3))
+    except ValueError:
+        data = {}
+    snap = str(data.get("snapshot") or "")
+    popup, page = "", snap
+    if snap.startswith("[open popup"):
+        popup, _, page = snap.partition("[the page under it:]")
+    heads = list(dict.fromkeys(_HEADING.findall(page)))[:6]
+    out = {"success": data.get("success", True),
+           "page_view": "older view of the page, replaced by newer ones below; its refs may be stale"}
+    for key in ("url", "title"):
+        if data.get(key):
+            out[key] = data[key]
+    pop = _HEADING.findall(popup)
+    if pop:
+        out["popup"] = pop[0]
+    if heads:
+        out["headings"] = heads
+    return match.group(1) + json.dumps(out, ensure_ascii=False) + match.group(4)
+
+
+def _slim_page_views(messages) -> Optional[list]:
+    """``messages`` with all but the newest PAGE_VIEWS_KEPT page views summarised, or None when nothing changes."""
+    views = [i for i, m in enumerate(messages)
+             if isinstance(m, dict) and m.get("role") == "tool" and _page_view(m.get("content"))]
+    old = views[:-PAGE_VIEWS_KEPT] if len(views) > PAGE_VIEWS_KEPT else []
+    if not old:
+        return None
+    out = list(messages)
+    for i in old:
+        out[i] = dict(out[i], content=_page_summary(_page_view(out[i]["content"])))
+    return out
 
 
 # ---- the ask_owner tool ----------------------------------------------------------------------------------------
