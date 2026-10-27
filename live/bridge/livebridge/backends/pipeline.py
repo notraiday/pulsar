@@ -177,7 +177,10 @@ TOOLS = [
             "confirmation or a code, the owner is asked by the speakers on its own."),
         "parameters": {"type": "object", "properties": {
             "request": {"type": "string",
-                        "description": "The full request in Russian, self-contained (resolve 'it', 'there', dates)."},
+                        "description": "The full request in Russian, self-contained (resolve 'it', 'there', dates), "
+                                       "in the owner's words: keep every detail they gave and add none of your "
+                                       "own (no sizes, amounts, prices, addresses or brands they did not say; "
+                                       "'средняя' stays 'средняя', not centimetres)."},
             "browser": {"type": "boolean",
                         "description": "true when it needs websites: ordering, booking, an account on a site, looking "
                                        "something up on a particular site (the agent then thinks it through)."},
