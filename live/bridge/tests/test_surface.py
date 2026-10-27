@@ -44,11 +44,14 @@ def fakes(seen, transcripts, hermes_delay=0.0, release=None, reply=None, model=N
         body = await req.json()
         seen["chat"].append(body)
         msgs = body["messages"]
+        if not body.get("stream"):                 # summarize(): the announcement of a finished job
+            seen.setdefault("summaries", []).append(msgs[-1]["content"])
+            return web.json_response({"choices": [{"message": {"content": "Заказала пиццу, привезут к восьми."}}]})
         if model is not None and (ev := model(body)) is not None:
             pass
         elif reply is not None:                    # the model answers by itself, without the agent
             ev = {"choices": [{"delta": {"content": reply}}]}
-        elif any("Агент закончил фоновую просьбу" in str(m.get("content")) for m in msgs):
+        elif any("Ты закончила дело" in str(m.get("content")) for m in msgs):
             ev = {"choices": [{"delta": {"content": "Заказ оформлен."}}]}
         elif any(m.get("role") == "tool" for m in msgs[-2:]):
             ev = {"choices": [{"delta": {"content": "Готово."}}]}
@@ -286,7 +289,8 @@ def test_a_background_request_with_no_dialog_left_is_announced_once(tmp_path, mo
             await s_runner.cleanup()
             return first, again
     first, again = asyncio.run(go())
-    assert first == {"announce": True} and again == {"announce": False}
+    assert first == {"announce": True, "text": "Заказала пиццу, привезут к восьми."} and again == {"announce": False}
+    assert "Чем кончилось (твои рабочие заметки): Готово." in seen["summaries"][0]
 
 
 def test_the_owner_steers_a_running_website_task_from_another_dialog(tmp_path, monkeypatch, fake_vad):
@@ -294,11 +298,13 @@ def test_the_owner_steers_a_running_website_task_from_another_dialog(tmp_path, m
 
     def model(body):
         system = body["messages"][0]["content"]
-        if body["messages"][-1].get("role") != "user" or "Агент закончил" in str(body["messages"][-1]["content"]):
+        if body["messages"][-1].get("role") != "user" or "Ты закончила дело" in str(body["messages"][-1]["content"]):
             return None
-        args = ({"request": "Пиццу пепперони вместо маргариты.", "task": 1} if "Задачи агента" in system
-                else {"request": "Закажи пиццу маргарита на сайте.", "browser": True})
-        return {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "function": {
+        if "Твои дела" in system:
+            args, said = {"request": "Лучше пепперони.", "task": 1}, "Хорошо, возьму пепперони."
+        else:
+            args, said = {"request": "Закажи пиццу маргарита на сайте.", "browser": True}, ""
+        return {"choices": [{"delta": {"content": said, "tool_calls": [{"index": 0, "id": "c1", "function": {
             "name": "ask_hermes", "arguments": json.dumps(args, ensure_ascii=False)}}]}}]}
 
     async def go():
@@ -318,7 +324,7 @@ def test_the_owner_steers_a_running_website_task_from_another_dialog(tmp_path, m
                 flags = await resp.json()
             r, w = await station(server.sockets[0].getsockname()[1])
             speak(w)
-            await frames_until(r, {b"A"})          # "passed it on"
+            await frames_until(r, {b"A"})          # "all right, pepperoni"
             w.write(wire.frame(b"D"))
             release.set()                          # the run ends with the change in it
             await frames_until(r, {b"A"})          # its result, in this dialog
@@ -330,11 +336,12 @@ def test_the_owner_steers_a_running_website_task_from_another_dialog(tmp_path, m
             return sid, flags, got
     sid, flags, got = asyncio.run(go())
     assert flags == {"background": True, "think": True}
-    assert seen["steers"] == ["Пиццу пепперони вместо маргариты."]
+    assert seen["steers"] == ["Лучше пепперони."]
     assert len(seen["hermes"]) == 1                # no second run: the dialog decided, no early request
-    assert seen["tts"][:3] == [pipeline.DETACHED_SPEECH, pipeline.STEERED_SPEECH, "Заказ оформлен."]
-    note = seen["chat"][-1]["messages"][-1]["content"]
-    assert "Учла: Пиццу пепперони вместо маргариты." in note
+    assert seen["tts"][:3] == [pipeline.DETACHED_SPEECH, "Хорошо, возьму пепперони.", "Заказ оформлен."]
+    steer_round = next(i for i, b in enumerate(seen["chat"]) if "Твои дела" in b["messages"][0]["content"])
+    assert "Учла: Лучше пепперони." in seen["chat"][steer_round + 1]["messages"][-1]["content"]  # no round between
+    assert "Задачи агента" not in str(seen["chat"]) and "передал" not in str(seen["tts"]).lower()
     assert got[-1] == (b"X", b"idle")
 
 
@@ -345,7 +352,7 @@ def test_a_finished_task_is_continued_in_its_own_session(tmp_path, monkeypatch, 
         system = body["messages"][0]["content"]
         if body["messages"][-1].get("role") != "user":
             return None
-        args = ({"request": "Когда привезут заказанную пиццу?", "task": 1} if "закончена" in system
+        args = ({"request": "Когда привезут заказанную пиццу?", "task": 1} if "закончено" in system
                 else {"request": "Закажи пиццу на сайте.", "browser": True})
         return {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "function": {
             "name": "ask_hermes", "arguments": json.dumps(args, ensure_ascii=False)}}]}}]}
@@ -372,6 +379,61 @@ def test_a_finished_task_is_continued_in_its_own_session(tmp_path, monkeypatch, 
     asyncio.run(go())
     assert seen["hermes"] == ["@@LIVE@@ Закажи пиццу на сайте.", "@@LIVE@@ Когда привезут заказанную пиццу?"]
     assert len(set(seen["sessions"])) == 1         # the second went on in the first one's session
+
+
+def test_the_dialog_an_announcement_opens_goes_on_with_that_job(tmp_path, monkeypatch, fake_vad):
+    seen = {"chat": [], "tts": [], "stt": 0, "hermes": []}
+
+    def model(body):
+        system = body["messages"][0]["content"]
+        if body["messages"][-1].get("role") != "user":
+            return None
+        if "ты закончила дело №1" in system:
+            args = {"request": "Добавь колу.", "task": 1}
+        else:
+            args = {"request": "Закажи пиццу на сайте.", "browser": True}
+        return {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "function": {
+            "name": "ask_hermes", "arguments": json.dumps(args, ensure_ascii=False)}}]}}]}
+
+    async def go():
+        release = asyncio.Event()
+        runner, port = await serve_app(fakes(seen, ["Закажи пиццу.", "Добавь колу."], release=release, model=model))
+        s_runner, s_port = await serve_app(surface.app())
+        setup(monkeypatch, port)
+        monkeypatch.setattr(agent, "HERMES_KEY", "hk")
+        monkeypatch.setattr(pipeline, "DETACH_S", 0.3)
+        routes = tmp_path / "routes.json"
+        routes.write_text(json.dumps({"default": "pipeline"}))
+        base = f"http://127.0.0.1:{s_port}"
+        async with aiohttp.ClientSession() as http:
+            server = await bridge.serve("127.0.0.1:0", Routes(routes), http)
+            sid = await background_request(http, server, seen)
+            async with http.post(f"{base}/result", json={"session": sid, "text": "Заказ №77 оформлен, курьер к 20:00."},
+                                 headers=AUTH) as resp:
+                ann = await resp.json()
+            release.set()
+            await until(lambda: not surface.registry.running())
+            # what Home Assistant's start_conversation with that text makes the station do
+            r, w = await station(server.sockets[0].getsockname()[1],
+                                 {"station": "kitchen", "protocol": 1, "reminder": ann["text"]})
+            await frames_until(r, {b"A"})          # the summary
+            w.write(wire.frame(b"D"))
+            await asyncio.sleep(0.5)
+            speak(w)
+            await frames_until(r, {b"A"})          # the job's answer
+            w.write(wire.frame(b"D"))
+            got = await frames_until(r, {b"X"})
+            server.close()
+            await runner.cleanup()
+            await s_runner.cleanup()
+            return sid, ann, got
+    sid, ann, got = asyncio.run(go())
+    assert ann == {"announce": True, "text": "Заказала пиццу, привезут к восьми."}
+    assert seen["tts"][1] == "Заказала пиццу, привезут к восьми."
+    system = next(b for b in seen["chat"] if b.get("stream") and "ты закончила дело №1" in b["messages"][0]["content"])
+    assert "Заказ №77 оформлен, курьер к 20:00." in system["messages"][0]["content"]
+    assert seen["hermes"][-1] == "@@LIVE@@ Добавь колу." and seen["sessions"] == [sid, sid]
+    assert got[-1] == (b"X", b"idle")
 
 
 def test_a_dropped_request_asks_nobody_and_is_not_announced(tmp_path, monkeypatch, fake_vad):
@@ -476,7 +538,7 @@ def test_a_background_request_asks_and_answers_in_the_dialog_in_progress(tmp_pat
     assert seen["tts"][:4] == [pipeline.DETACHED_SPEECH, surface.FOREIGN_LEAD + "Какой цвет коробки?",
                                pipeline.ACKS["text"], "Заказ оформлен."]
     note = seen["chat"][-1]["messages"][-1]["content"]
-    assert "Агент закончил фоновую просьбу «сделай»: Заказ оформлен, привезут к восьми." in note
+    assert "Ты закончила дело «сделай». Итог: Заказ оформлен, привезут к восьми." in note
     assert got[-1] == (b"X", b"idle")
 
 

@@ -42,7 +42,7 @@ import aiohttp
 from .. import reminders, stt, surface
 from ..agent import Agent
 from ..session import Session
-from ..util import ZDR, BackendUnavailable, HERE, clean_for_speech, read_instructions, wav16k
+from ..util import TAG_RE, ZDR, BackendUnavailable, HERE, clean_for_speech, read_instructions, wav16k
 from ..wire import Station, frame
 
 log = logging.getLogger("live")
@@ -67,12 +67,11 @@ LLM_HEDGE_S = float(os.environ.get("LIVE_LLM_HEDGE_S", "1.5"))  # nothing useful
 TTS_HEDGE_S = float(os.environ.get("LIVE_TTS_HEDGE_S", "0.8"))  # no audio after this long: race a 2nd TTS request (0 = off)
 AGENT_RACE = os.environ.get("LIVE_AGENT_RACE", "1") != "0"  # first turn: the agent is asked with the transcript at once
 DETACH_S = float(os.environ.get("LIVE_AGENT_DETACH_S", "20"))  # an agent request still running this long goes on in the background (0 = never)
-DETACHED_NOTE = ("Агент продолжает эту задачу в фоне. Если ему понадобится код или подтверждение, он сам спросит хозяина "
-                 "через колонку, а результат скажет, когда закончит.")
+DETACHED_NOTE = ("Это дело идёт дальше в фоне: если понадобится код или подтверждение, ты спросишь хозяина сама, итог "
+                 "скажешь, когда закончишь.")
 DETACHED_SPEECH = "Это надолго — занимаюсь, позову, если что-то понадобится."
-STEERED_NOTE = ("Передано агенту в идущую задачу: он учтёт это после текущего шага. Итог этой задачи придёт, когда "
-                "закончит.")
-STEERED_SPEECH = "Передала, учтёт по ходу."
+STEERED_NOTE = ("Принято в идущее дело: ты учтёшь это после текущего шага, итог скажешь, когда закончишь. Если хозяину "
+                "ещё ничего не ответила — коротко подтверди от себя («Хорошо, добавлю»).")
 ACKS = {"code": "Принято, ввожу.", "yes": "Хорошо.", "no": "Поняла, не делаю.", "text": "Поняла."}
 _background: set = set()  # detached agent requests: they outlive their dialog
 _session_of: "weakref.WeakKeyDictionary[asyncio.Task, str]" = weakref.WeakKeyDictionary()  # agent request -> agent session
@@ -127,14 +126,27 @@ TEXT_NOTE = (
     "бессмысленна (обрывок слова, случайный набор слов) или это явно чужой разговор или телевизор; любая обычная "
     "реплика, просьба или подкол — это тебе, отвечай.")
 
-# Added to the persona while the agent has jobs the owner may come back to (surface.Job): this dialog's or earlier ones'.
+# Added to the persona while there are jobs the owner may come back to (surface.Job): this dialog's or earlier ones'.
 JOBS_NOTE = (
-    "\n\nЗадачи агента (идущие и недавние):\n{jobs}\n"
-    "Реплика хозяина про одну из них (уточнить, добавить, изменить, продолжить, спросить подробности того, что "
-    "агент сделал) — ask_hermes с task=её номер: идущей задаче агент получит это на ходу, законченную продолжит "
-    "со всем, что уже знает. Новая, не связанная просьба — ask_hermes без task (новый запрос ничего не знает об "
-    "этих задачах). «Как там дела?» про идущую задачу — отвечай по этому списку сама. Отменить идущую — "
-    "stop_background с номером. Агенту нужен ответ хозяина — он спросит сам.")
+    "\n\nТвои дела, идущие и недавние (ты делаешь их сама, через ask_hermes):\n{jobs}\n"
+    "Реплика хозяина про одно из них — уточнить, добавить, изменить, продолжить, спросить, что именно сделано, — "
+    "ask_hermes с task=номер, а в request его слова как есть: идущее дело ты учтёшь на ходу, законченное "
+    "продолжишь со всем, что о нём знаешь. Новое, не связанное — ask_hermes без task (там об этих делах ничего не "
+    "известно). «Как там?» про идущее дело — отвечай сама по этому списку. Отменить идущее — stop_background с "
+    "номером. Код или подтверждение ты спросишь у хозяина сама, когда понадобится.{current}")
+CURRENT_JOB = "\nСейчас разговор о деле №{no}."
+# Added to the persona of a dialog the house opened to tell a job's result (surface /result: "announce").
+ANNOUNCED_NOTE = (
+    "\n\nЭтот разговор начала ты сама: ты закончила дело №{no} («{request}») и только что сказала хозяину вслух: "
+    "«{text}». Подробный итог, который ты знаешь: {result}\nСпросит подробности — отвечай по нему. Захочет что-то ещё "
+    "по этому делу (добавить, изменить, продолжить) — ask_hermes с task={no} и его словами как есть. Просто "
+    "подтвердил («ок», «спасибо», «понял») — сразу вызови end_dialog.")
+# How the house's announcement of a finished job is written (summarize()).
+SUMMARY_NOTE = (
+    "\n\nСейчас ты сама начинаешь разговор: ты закончила дело хозяина и говоришь ему итог. Одна-две короткие фразы "
+    "по-русски, от первого лица, главное: что сделано, ключевые цифры, сроки или время. Без списков длиннее трёх "
+    "пунктов (подробности хозяин спросит сам), без слов «агент», «задача номер», без английского. Если от хозяина "
+    "что-то нужно — короткий вопрос в конце. Ответ — только то, что ты скажешь вслух.")
 
 SENT_RE = re.compile(r"(.+?[.!?…]+[\"»)]?)(?:\s+|$)", re.S)
 
@@ -146,10 +158,11 @@ TOOLS = [
             "real world or personal data: smart home control and device states (lights, switches, climate, "
             "vacuum, media), timers and reminders, calendar, money and spending, mail, weather, web "
             "search, websites (it has a browser: orders, bookings, accounts) and the owner's remembered facts. "
-            "Never claim an action happened unless this tool's answer says so. Alongside the call say at most a "
-            "short filler ('Щас гляну.', 'Займусь.'): do not ask the owner the agent's questions yourself and do "
-            "not guess its answer; when the agent needs a choice, a confirmation or a code it asks the owner "
-            "itself."),
+            "Never claim an action happened unless this tool's answer says so. To the owner you and this tool are "
+            "one: speak of its work as your own ('Сейчас найду', 'Добавлю', 'Заказала'), never 'передала', "
+            "'агент', 'Гермес'. Alongside the call say at most a short filler ('Щас гляну.', 'Займусь.'): do not "
+            "ask the owner its questions yourself and do not guess its answer; when it needs a choice, a "
+            "confirmation or a code, the owner is asked by the speakers on its own."),
         "parameters": {"type": "object", "properties": {
             "request": {"type": "string",
                         "description": "The full request in Russian, self-contained (resolve 'it', 'there', dates)."},
@@ -157,8 +170,9 @@ TOOLS = [
                         "description": "true when it needs websites: ordering, booking, an account on a site, looking "
                                        "something up on a particular site (the agent then thinks it through)."},
             "task": {"type": "integer",
-                     "description": "Only when this is about one of the agent's tasks listed in the instructions: its "
-                                    "number. Omit for anything new."}},
+                     "description": "Only when this is about one of your ongoing or recent jobs listed in the "
+                                    "instructions: its number (request: the owner's words as they are). Omit for "
+                                    "anything new."}},
             "required": ["request"]}}},
     {"type": "function", "function": {
         "name": "end_dialog",
@@ -171,8 +185,8 @@ TOOLS = [
 # Offered only while the agent has running jobs.
 STOP_TOOL = {"type": "function", "function": {
     "name": "stop_background",
-    "description": "Stop a running task of the agent (numbered in the instructions), when the owner asks to cancel or "
-                   "stop it. The agent's run is interrupted; what it already did stays done.",
+    "description": "Stop one of your running jobs (numbered in the instructions), when the owner asks to cancel or "
+                   "stop it. The work is interrupted; what was already done stays done.",
     "parameters": {"type": "object", "properties": {"number": {"type": "integer"}}, "required": ["number"]}}}
 
 
@@ -223,6 +237,8 @@ class Dialog(Session):
         self.asked = {}        # call id -> the agent request, for notes about results the owner has not heard
         self.questions = []    # surface.Ask the agent asked the owner, the first one is being asked
         self.in_tools = False  # the reply waits for its tool calls (the agent may be asking the owner meanwhile)
+        self.round_said = False  # the last model round said something (not only tool calls)
+        self.job_no = 0        # the job this dialog is about (its announcement opened it, or the owner went back to it)
         self.woken = False     # the house opened this dialog to ask the owner something (surface.py)
 
     async def open(self):
@@ -250,6 +266,12 @@ class Dialog(Session):
                 a.holders.add(self)
                 self.questions.append(a)
                 log.info("dialog opened for ask %s (%s)", a.id, a.kind)
+            elif (job := surface.registry.for_announcement(reminder)) is not None:
+                self.job_no = job.no  # the house tells a job's result: the owner may go on with it
+                surface.registry.bind(job.session, self)
+                self.instructions += ANNOUNCED_NOTE.format(no=job.no, request=job.request[:300], text=reminder,
+                                                           result=job.result[:1500] or reminder)
+                log.info("dialog opened for job №%d", job.no)
             else:
                 self.instructions += REMINDER_NOTE.format(text=reminder)
             reminders.join(self, reminder, self.tts_chunks)
@@ -368,14 +390,16 @@ class Dialog(Session):
 
     # ---- requests running in the background (surface.py) ----
     def background_result(self, request: str, text: str):
-        """A background request another dialog started has finished while the owner is in this one."""
-        self.notes.append(f"(Агент закончил фоновую просьбу «{request}»: {text or 'готово.'} Расскажи хозяину.)")
+        """A job that went on in the background has finished while the owner is in this dialog."""
+        self.notes.append(f"(Ты закончила дело «{request}». Итог: {text or 'готово.'} Скажи хозяину главное коротко, "
+                          "от себя; подробности — если спросит.)")
 
     def jobs_note(self, jobs) -> str:
         if not jobs:
             return ""
         now = time.monotonic()
-        return JOBS_NOTE.format(jobs="\n".join(j.describe(now) for j in jobs))
+        current = CURRENT_JOB.format(no=self.job_no) if any(j.no == self.job_no for j in jobs) else ""
+        return JOBS_NOTE.format(jobs="\n".join(j.describe(now) for j in jobs), current=current)
 
     def stop_background(self, args: dict) -> str:
         job = surface.registry.job(args.get("number"))
@@ -567,6 +591,8 @@ class Dialog(Session):
                 for c, r in zip(calls, results):
                     self.history.append({"role": "tool", "tool_call_id": c["id"], "content": r})
                     self.tools.pop(c["id"], None)
+                if self.round_said and all(r == STEERED_NOTE for r in results):
+                    break  # what was said alongside the call is the reply ("Хорошо, добавлю")
                 direct = self.direct_answer(calls, results)
                 if direct:
                     log.info("direct answer from the agent (%d chars), no second model round", len(direct))
@@ -608,8 +634,6 @@ class Dialog(Session):
             return ""
         if results[0] == DETACHED_NOTE:
             return DETACHED_SPEECH
-        if results[0] == STEERED_NOTE:
-            return STEERED_SPEECH
         text = clean_for_speech(results[0])
         if not text or len(text) > DIRECT_MAX or text.startswith(("Агент не ответил", "Сделано, ответ пустой")):
             return ""
@@ -751,6 +775,7 @@ class Dialog(Session):
             self.history.append(msg)
         log.info("llm %.1fs [%s]: %r tools=%s", time.monotonic() - t0, self.llm_provider,
                  msg["content"] and msg["content"][:200], [c["name"] for c in calls_l])
+        self.round_said = bool(msg["content"])
         return calls_l
 
     async def flush_sentences(self, pending: str, q: asyncio.Queue, final: bool) -> str:
@@ -913,7 +938,8 @@ class Dialog(Session):
         one goes on in its own session (the agent knows everything it did)."""
         job = surface.registry.job(no)
         if job is None:
-            return "Нет задачи с таким номером: если это новая просьба, вызови ask_hermes без task."
+            return "Нет дела с таким номером: если это новая просьба, вызови ask_hermes без task."
+        self.job_no = job.no
         surface.registry.bind(job.session, self)  # its questions and its answer come to this dialog now
         if job.running:
             run_id = surface.registry.runs.get(job.session, "")
@@ -922,7 +948,8 @@ class Dialog(Session):
                 return STEERED_NOTE
             await asyncio.wait({job.task}, timeout=10)  # finishing just now: continue it once it has
             if job.running:
-                return "Агент сейчас не может принять это в идущую задачу. Скажи хозяину, что передашь, когда он закончит."
+                return ("Сейчас это не принять в идущее дело: скажи хозяину от себя, что учтёшь, как только закончишь "
+                        "текущий шаг, и предложи повторить чуть позже.")
         log.info("job №%d continued in its session %s: %r", job.no, job.session, request[:120])
         task = asyncio.create_task(self.ask_agent(request, session=job.session,
                                                   think=browser or job.session in surface.registry.think))
@@ -944,19 +971,53 @@ class Dialog(Session):
 
         def run(run_id: str):
             surface.registry.runs[_session_of.get(task, "")] = run_id
+
+        def said(text: str):
+            surface.registry.said(_session_of.get(task, ""), text)
         sid = session or (f"live-{secrets.token_hex(8)}" if self.agent.names_sessions() else "")
         if sid:
             bound(sid)
             if think:
                 self.website_task(sid, request, task)
         try:
-            return await self.agent.ask(request, on_session=bound, session=sid, on_progress=step, on_run=run)
+            return await self.agent.ask(request, on_session=bound, session=sid, on_progress=step, on_run=run,
+                                        on_said=said)
         except asyncio.CancelledError:
             surface.registry.abandon(_session_of.get(task, ""), self)
             raise
         except Exception as e:
             log.warning("agent failed: %r", e)
             return f"Агент не ответил: {e}"[:300]
+
+
+async def summarize(request: str, result: str) -> str:
+    """What the speakers say when a job finished with no dialog to tell it in: a short summary in the dialog
+    model's voice (its persona), not the agent's working notes. Falls back to the result itself."""
+    fallback = clean_for_speech(TAG_RE.sub("", result))[:400] or "Готово."
+    if not OR_KEY:
+        return fallback
+    body = {"model": LLM, "stream": False, "messages": [
+        {"role": "system", "content": read_instructions() + SUMMARY_NOTE},
+        {"role": "user", "content": f"Просьба хозяина: «{request[:400]}»\nЧем кончилось (твои рабочие заметки): "
+                                    f"{result[:3000]}"}]}
+    prov = provider_for(LLM)
+    if prov:
+        body["provider"] = prov
+    reasoning = reasoning_for(LLM)
+    if reasoning:
+        body["reasoning"] = reasoning
+    t0 = time.monotonic()
+    try:
+        async with aiohttp.ClientSession() as http:
+            async with http.post(f"{OR_BASE}/chat/completions", json=body, headers=or_headers(), proxy=OR_PROXY,
+                                 timeout=aiohttp.ClientTimeout(total=8)) as r:
+                data = await r.json(content_type=None)
+        text = clean_for_speech(TAG_RE.sub("", str(data["choices"][0]["message"].get("content") or "")))
+    except Exception as e:
+        log.warning("summary failed (%r): announcing the result as it is", e)
+        return fallback
+    log.info("summary %.1fs: %r", time.monotonic() - t0, text[:200])
+    return text or fallback
 
 
 async def run(station: Station, http: aiohttp.ClientSession, options: dict):

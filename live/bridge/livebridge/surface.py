@@ -14,9 +14,10 @@ The agent side (a Hermes plugin) talks to it over HTTP (LIVE_SURFACE_LISTEN, bea
                 A request the dialog dropped (cancelled) gets no questions: status "no_answer" at once.
   GET  /ask/ID?wait=S                -> {"status": "answered"|"unclear"|"timeout"|"no_answer"|"pending", "answer"}
                 "code": the digits; "confirm": "yes" | "no"; "text": the transcript.
-  POST /result  {"session", "text"}  -> {"announce": bool}
+  POST /result  {"session", "text"}  -> {"announce": bool, "text"}
                 The agent is about to answer. The dialog that asked speaks it while it lasts; once it has ended, a
-                Live dialog in progress gets it (spoken there); with none, true: the caller announces it.
+                Live dialog in progress gets it (spoken there); with none, true: the caller announces "text", a short
+                spoken summary, and the dialog that opens with it goes on with that job.
                 Sessions the bridge never saw (Home Assistant's own pipeline) are never announced.
   GET  /session/ID                   -> {"background": bool, "think": bool}
                 The request went on in the background (nobody waits for it), or is a website task: the agent
@@ -93,6 +94,7 @@ class Job:
         self.task: asyncio.Task | None = None
         self.started = time.monotonic()
         self.step, self.step_at = "", 0.0
+        self.said = ""             # what the agent last wrote about it on the way ("Открываю статью про Омск.")
         self.done_at: float | None = None
         self.result = ""
         self.told = False          # its answer reached the owner (a dialog's note, or an announcement)
@@ -105,7 +107,7 @@ class Job:
         """A run of this job's session (the first one, or one continuing it)."""
         if task is self.task:
             return
-        self.task, self.started, self.done_at, self.told = task, time.monotonic(), None, False
+        self.task, self.started, self.done_at, self.told, self.said = task, time.monotonic(), None, False, ""
         task.add_done_callback(self._finished)
 
     def _finished(self, t: asyncio.Task):
@@ -116,22 +118,28 @@ class Job:
             self.result = "остановлена."
         elif t.exception() is not None:
             self.result = f"не удалась: {t.exception()}"[:200]
-        else:
-            self.result = str(t.result())[:300]
+        elif not self.result:  # the agent side's /result has the same, usually earlier
+            self.result = str(t.result())[:1500]
 
     def describe(self, now: float) -> str:
         out = f"№{self.no}. «{self.request[:200]}» — "
         if self.running:
             out += f"идёт {_ago(now - self.started)}"
             if self.step:
-                out += f"; последний шаг агента {_ago(now - self.step_at)} назад: {self.step}"
+                out += f"; сейчас ({_ago(now - self.step_at)} назад): {self.step}"
+            if self.said:
+                out += f"; твоя последняя заметка по ходу: «{self.said[:300]}»"
         else:
-            out += f"закончена {_ago(now - (self.done_at or now))} назад: {self.result}"
+            out += f"закончено {_ago(now - (self.done_at or now))} назад; итог: {self.result[:1000]}"
         return out
 
 
 def _ago(s: float) -> str:
     return f"{int(s // 60)} мин" if s >= 60 else f"{int(s)} с"
+
+
+def _key(text: str) -> str:
+    return " ".join(clean_for_speech(text).lower().split())
 
 
 def _live(d) -> bool:
@@ -153,6 +161,7 @@ class Registry:
         self.known: set[str] = set()      # sessions a dialog started: only theirs are ever announced
         self.abandoned: set[str] = set()  # requests nobody waits for: their questions are not put to anyone
         self.asks: dict[str, Ask] = {}
+        self.announcing: dict[str, Job] = {}  # announcement text -> its job (the dialog it opens goes on with it)
 
     # ---- dialogs and agent sessions ----
     def opened(self, dialog):
@@ -210,6 +219,11 @@ class Registry:
         job = self.jobs.get(session)
         if job is not None and step:
             job.step, job.step_at = step[:120], time.monotonic()
+
+    def said(self, session: str, text: str):
+        job = self.jobs.get(session)
+        if job is not None and text.strip():
+            job.said = text.strip()[-400:]
 
     def listed(self) -> list[Job]:
         """The jobs a dialog model is told about: running ones, and ones finished in the last RECENT_S."""
@@ -292,10 +306,23 @@ class Registry:
             return "none"
         if job is not None:
             job.told = True
+            if text:
+                job.result = text[:1500]
         if d is not None:
             d.background_result(job.request if job else "", text)
             return "note"
         return "announce"
+
+    def announce(self, session: str, text: str):
+        """`text` is what the speakers will open a dialog with for this session's job."""
+        job = self.jobs.get(session)
+        if job is not None:
+            self.announcing = {k: j for k, j in self.announcing.items() if j.done_at and j is not job}
+            self.announcing[_key(text)] = job
+
+    def for_announcement(self, text: str) -> Job | None:
+        """The job a dialog the house just opened with `text` announces."""
+        return self.announcing.get(_key(text))
 
     def prune(self):
         now = time.monotonic()
@@ -356,9 +383,17 @@ async def _post_result(request: web.Request):
     session = str(body.get("session") or "")
     # Only sessions a Live dialog started: the agent also answers Home Assistant's own pipeline, which speaks
     # its answers itself.
-    who = registry.result(session, str(body.get("text") or "").strip())
+    text = str(body.get("text") or "").strip()
+    who = registry.result(session, text)
     log.info("result of %s: %s", session or "?", _RESULT_LOG[who])
-    return web.json_response({"announce": who == "announce"})
+    if who != "announce":
+        return web.json_response({"announce": False})
+    # What the speakers say: a short summary in the dialog's own voice; the dialog it opens goes on with the job.
+    from .backends import pipeline
+    job = registry.jobs.get(session)
+    summary = await pipeline.summarize(job.request if job else "", text)
+    registry.announce(session, summary)
+    return web.json_response({"announce": True, "text": summary})
 
 
 async def _get_session(request: web.Request):

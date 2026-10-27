@@ -93,17 +93,19 @@ class Agent:
         """Requests are runs: they can be steered and stopped."""
         return self.names_sessions() and HERMES_RUNS and bool(runs_base())
 
-    async def ask(self, request: str, on_session=None, session: str = "", on_progress=None, on_run=None) -> str:
+    async def ask(self, request: str, on_session=None, session: str = "", on_progress=None, on_run=None,
+                  on_said=None) -> str:
         """The agent's answer to a self-contained request; raises when there is none. `session`: the agent session
         to run it in (names_sessions(); an existing one is continued); `on_session(id)`: called with the agent's
         session id as soon as it is known; `on_progress(step)`: each tool the agent starts, as its own one-line
-        preview; `on_run(id)`: the run's id, for steer() (hermes only)."""
+        preview; `on_run(id)`: the run's id, for steer(); `on_said(text)`: what the agent writes between its steps
+        (hermes runs only)."""
         t0 = time.monotonic()
         text = f"{MARK} {request}" if MARK else request
         if self.kind == "ha":
             answer = await self._ask_ha(text)
         elif self.runs() and session:
-            answer = await self._ask_run(text, session, on_session, on_progress, on_run)
+            answer = await self._ask_run(text, session, on_session, on_progress, on_run, on_said)
         else:
             answer = await self._ask_hermes(text, on_session, session, on_progress)
         answer = TAG_RE.sub("", answer).strip()
@@ -154,7 +156,7 @@ class Agent:
     def _headers(self) -> dict:
         return {"Authorization": f"Bearer {HERMES_KEY}"} if HERMES_KEY else {}
 
-    async def _ask_run(self, text: str, session: str, on_session, on_progress, on_run) -> str:
+    async def _ask_run(self, text: str, session: str, on_session, on_progress, on_run, on_said=None) -> str:
         base = runs_base()
         async with self.http.post(f"{base}/runs", json={"input": text, "session_id": session}, headers=self._headers(),
                                   timeout=aiohttp.ClientTimeout(total=30)) as r:
@@ -168,14 +170,14 @@ class Agent:
         if on_run is not None:
             on_run(run_id)
         try:
-            return await self._run_events(base, run_id, on_progress)
+            return await self._run_events(base, run_id, on_progress, on_said)
         except asyncio.CancelledError:
             t = asyncio.get_running_loop().create_task(self.stop_run(run_id))  # closing the events does not stop it
             _stopping.add(t)
             t.add_done_callback(_stopping.discard)
             raise
 
-    async def _run_events(self, base: str, run_id: str, on_progress) -> str:
+    async def _run_events(self, base: str, run_id: str, on_progress, on_said=None) -> str:
         """The run's answer (its last message) from its event stream; a dropped stream is resumed after the last
         event seen."""
         seq, drops = -1, 0
@@ -203,6 +205,8 @@ class Agent:
                         name = ev.get("event")
                         if name == "tool.started" and on_progress is not None:
                             on_progress(str(ev.get("preview") or ev.get("tool") or ""))
+                        elif name == "message.interim" and on_said is not None:
+                            on_said(TAG_RE.sub("", str(ev.get("text") or "")))
                         elif name == "run.completed":
                             return str(ev.get("output") or "")
                         elif name == "run.failed":

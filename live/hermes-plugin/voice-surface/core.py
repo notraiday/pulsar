@@ -8,8 +8,8 @@ can answer. In this profile's api_server sessions the Live bridge can, so:
   * a card fill is confirmed by voice, naming the card and the site;
   * the ``ask_owner`` tool lets the agent ask a yes / no or a short question (before it orders or pays);
   * after every turn the bridge is told the answer is ready (/result); when the Live dialog that asked has ended
-    (the request went on in the background) and no other one is in progress, the answer is announced through Home
-    Assistant (``wake_script``);
+    (the request went on in the background) and no other one is in progress, the bridge's short spoken summary of
+    it is announced through Home Assistant (``wake_script``), and the dialog that opens goes on with that job;
   * website tasks and requests that went on in the background think: their model calls carry
     ``hermes_live_think``, which the model router in front of the agent turns into its thinking model
     (litellm-taint, ``cloud-think``) - except the step right after a browser action that worked (a click, typing:
@@ -239,10 +239,12 @@ def post_llm_call(session_id: str = "", assistant_response: Any = "", platform: 
         text = _TAG_RE.sub("", str(assistant_response or "")).strip()
         if not session_id or not text:
             return None
-        if _bridge("POST", "/result", {"session": session_id, "text": text[:2000]}).get("announce"):
+        res = _bridge("POST", "/result", {"session": session_id, "text": text[:2000]}, timeout=15)
+        if res.get("announce"):
+            say = str(res.get("text") or "").strip() or text[:600]  # the bridge's spoken summary of it
             log.info("voice-surface: the dialog of %s has ended; announcing its answer", session_id)
             # the profile (Hermes home, config, secrets) is context-local: the thread runs in this turn's context
-            threading.Thread(target=contextvars.copy_context().run, args=(wake, text[:600]), daemon=True).start()
+            threading.Thread(target=contextvars.copy_context().run, args=(wake, say), daemon=True).start()
     except Exception as e:  # never break the turn
         log.warning("voice-surface: post_llm_call failed: %r", e)
     return None
