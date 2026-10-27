@@ -32,6 +32,9 @@ END_SILENCE_MS = int(os.environ.get("LIVE_END_SILENCE_MS", "600"))
 END_SILENCE_LONG_MS = int(os.environ.get("LIVE_END_SILENCE_LONG_MS", "1400"))
 START_MS = int(os.environ.get("LIVE_START_MS", "192"))
 BARGE_MS = int(os.environ.get("LIVE_BARGE_MS", "480"))   # speech needed to cut an answer that is playing or being made
+# the owner must be this many dB louder than our own echo in the mic to count as a barge-in (else it is the station
+# hearing its own playback that the station's echo canceller did not fully remove, not the owner)
+BARGE_ECHO_MARGIN_DB = float(os.environ.get("LIVE_BARGE_ECHO_MARGIN_DB", "4"))
 MIN_SPEECH_MS = int(os.environ.get("LIVE_MIN_SPEECH_MS", "320"))
 MAX_UTT_S = float(os.environ.get("LIVE_MAX_UTT_S", "25"))
 FRAME_MS = 32
@@ -249,6 +252,10 @@ class Session:
             recent = self.flags[-need:]
             if len(recent) == need and sum(recent) >= math.ceil(need * VOICED_RATIO):
                 if self.speaking and not answering:
+                    cand = sum(self.dbs[-need:]) / need
+                    base_n = self.echo[0] - need  # echo floor before this voiced run (its frames are in self.echo too)
+                    if base_n >= need and cand < (self.echo[1] - sum(self.dbs[-need:])) / base_n + BARGE_ECHO_MARGIN_DB:
+                        return  # no louder than our own echo in the mic: it is the playback, not the owner
                     self.barge_in(need)
                 elif busy and not answering:
                     log.info("the owner talks while the answer is being made: it waits")

@@ -80,6 +80,7 @@ HEARD_LAG_S = float(os.environ.get("LIVE_HEARD_LAG_S", "0.3"))
 # The owner goes on talking this soon after the end of their turn, before any of the answer was heard: it is one turn
 # (the cut answer and its requests are dropped, the next utterance joins the turn).
 MERGE_S = float(os.environ.get("LIVE_MERGE_S", "2.5"))
+RESUME_MAX = int(os.environ.get("LIVE_RESUME_MAX", "1"))  # times a cut answer is picked back up from noise before it is let go (a real command still re-answers); stops an echo-driven resume loop
 WAKE_RE = re.compile(r"^(алиса|алис|яндекс)[\s,.!?…]*$", re.I)  # a lone wake word is not a command
 WAKE_RE_LEAD = re.compile(r"^(алиса|алис|яндекс)[\s,.!?…]+", re.I)  # a stray wake word at the start of a turn
 _background: set = set()  # detached agent requests: they outlive their dialog
@@ -265,6 +266,7 @@ class Dialog(Session):
         self.silent = None     # (the owner's turn, when) the model left without any answer (it was not finished?)
         self.enq = []          # sentences of the answer put to the TTS, in order (for resuming after a bare cut)
         self.resume = None     # {"left", "msgs", "full"}: the unplayed tail to resume if the cut carried no command
+        self.resumed = 0       # times this answer has been picked back up from a promptless cut (capped by RESUME_MAX)
 
     async def open(self):
         if not OR_KEY:
@@ -572,11 +574,16 @@ class Dialog(Session):
     def on_noise(self):
         if self.turn_open or self.utt is not None:
             return
-        if self.resume is not None:
+        if self.resume is not None and self.resumed < RESUME_MAX:
             log.info("the interruption carried no command: resuming the answer")
             self.cut = None
             self.turn_open = True
             self.resp = asyncio.create_task(self._resume())
+        elif self.resume is not None:
+            log.info("the answer was picked back up %d time(s) already: letting it go, not resuming again", self.resumed)
+            self.resume = None
+            if not self.speaking and not self.ending:
+                self.set_state("listening")
         elif self.cut is not None:
             log.info("it was noise: the turn cut short is answered again")
             cut, self.cut = self.cut, None
@@ -591,6 +598,7 @@ class Dialog(Session):
         if resume is None:
             self.turn_open = False
             return
+        self.resumed += 1
         self.turn_open = True
         self.touch()
         q: asyncio.Queue = asyncio.Queue()
@@ -709,9 +717,17 @@ class Dialog(Session):
             bare = text is not None and (not stt.has_words(text) or bool(WAKE_RE.match(text.strip())))
             if self.resume is not None and bare:
                 # the owner cut in while it was talking but said no command (silence / just the wake word): go on
-                log.info("the interruption carried no command: resuming the answer")
+                if self.resumed < RESUME_MAX:
+                    log.info("the interruption carried no command: resuming the answer")
+                    self.turn_open = False
+                    self.spawn(self._resume())
+                    return
+                log.info("the interruption carried no command, but the answer was already picked back up: letting it go")
+                self.resume = None
                 self.turn_open = False
-                self.spawn(self._resume())
+                self.touch()
+                if not self.speaking and not self.ending:
+                    self.set_state("listening")
                 return
             if stt.mode() == "text" and text is not None and not stt.has_words(text):
                 if cut is None or cut["user"] is (silent or (None,))[0]:
@@ -737,6 +753,7 @@ class Dialog(Session):
                 early = self.race(text)
         else:
             early = None
+        self.resumed = 0  # a fresh answer (not a resume): the pick-up count starts over
         q: asyncio.Queue = asyncio.Queue()
         self.tts_task = asyncio.create_task(self.tts_worker(q))
         try:

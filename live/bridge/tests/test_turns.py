@@ -191,3 +191,25 @@ def test_a_lone_wake_word_over_the_answer_resumes_it(tmp_path, monkeypatch, fake
                [(LOUDER, 12), (QUIET, 55), (LOUDER, 20), (QUIET, 90)], reply=reply, tts_s=1.0)
     assert len(seen["chat"]) == 1
     assert "Гамма предложение три." in seen["tts"]
+
+
+def test_a_resume_is_not_picked_back_up_again_after_more_noise(tmp_path, monkeypatch, fake_vad):
+    # the owner barges in twice without a command: the answer is picked back up once, then let go — no resume loop
+    # (the station hearing its own resumed playback must not spiral into endless re-resuming). RESUME_MAX = 1.
+    answer = "Первое раз. Второе два. Третье три. Четвёртое четыре. Пятое пять. Шестое шесть."
+
+    def reply(body):
+        return answer if len(users(body)) == 1 else "Не должно быть."
+    resumes = []
+    orig = pipeline.Dialog._resume
+
+    async def counting(self):
+        resumes.append(1)
+        return await orig(self)
+    monkeypatch.setattr(pipeline.Dialog, "_resume", counting)
+    # barge once mid-answer (resume), then again during the resume: the second cut must NOT resume again
+    seen = run(tmp_path, monkeypatch, ["Расскажи что-нибудь.", "", ""],
+               [(LOUDER, 12), (QUIET, 55), (LOUDER, 20), (QUIET, 20), (LOUDER, 20), (QUIET, 90)],
+               reply=reply, tts_s=1.0)
+    assert len(seen["chat"]) == 1        # never re-answered
+    assert len(resumes) == 1             # picked back up exactly once — the loop would call it again and again
