@@ -9,14 +9,15 @@ The agent side (a Hermes plugin) talks to it over HTTP (LIVE_SURFACE_LISTEN, bea
                 ("wake": true), the caller wakes the speakers itself (Home Assistant's start_conversation with
                 exactly this text): the dialogs that open with it take the question; the one that hears the
                 owner loudest gets the answer (reminders.py).
-  GET  /ask/ID?wait=S                -> {"status": "answered"|"unclear"|"timeout"|"pending", "answer"}
+                A request the dialog dropped (cancelled) gets no questions: status "no_answer" at once.
+  GET  /ask/ID?wait=S                -> {"status": "answered"|"unclear"|"timeout"|"no_answer"|"pending", "answer"}
                 "code": the digits; "confirm": "yes" | "no"; "text": the transcript.
   POST /result  {"session", "text"}  -> {"announce": bool}
                 The agent is about to answer: true when a Live dialog started that session and nobody is listening
                 for it any more (the dialog has ended), so the caller announces it. Sessions the bridge never saw
                 (Home Assistant's own pipeline) are never announced.
 
-Agent sessions are bound to dialogs by the X-Hermes-Session-Id the agent returns (agent.py).
+Agent sessions are bound to dialogs by their X-Hermes-Session-Id: the dialog names each request's session (agent.py).
 """
 import asyncio
 import hmac
@@ -78,6 +79,7 @@ class Registry:
         self.detached: set[str] = set()
         self.known: set[str] = set()      # sessions a dialog started: only theirs are ever announced
         self.announced: set[str] = set()
+        self.abandoned: set[str] = set()  # requests nobody waits for: their questions are not put to anyone
         self.asks: dict[str, Ask] = {}
 
     # ---- agent sessions ----
@@ -85,6 +87,19 @@ class Registry:
         if session:
             self.dialogs[session] = dialog
             self.known.add(session)
+            self.announced.discard(session)
+            self.abandoned.discard(session)
+
+    def abandon(self, session: str, dialog):
+        """The dialog stopped waiting for this session's request (and closed it, which interrupts the agent)."""
+        if not session or self.dialogs.get(session) is not dialog:
+            return
+        del self.dialogs[session]
+        self.abandoned.add(session)
+        for a in self.asks.values():
+            if a.session == session:
+                a.resolve("no_answer")
+        log.info("session %s abandoned: its request was dropped", session)
 
     def detach(self, session: str):
         if session:
@@ -100,7 +115,10 @@ class Registry:
         a = Ask(session, kind, text, timeout)
         self.asks[a.id] = a
         d = self.dialogs.get(session)
-        if d is not None and not d.ending and not d.st.closing and d.take_ask(a):
+        if session in self.abandoned:
+            log.info("ask %s (%s) for %s: its request was dropped, not asked", a.id, kind, session)
+            a.resolve("no_answer")
+        elif d is not None and not d.ending and not d.st.closing and d.take_ask(a):
             log.info("ask %s (%s) in the live dialog of %s", a.id, kind, session)
         else:
             a.wake = True
@@ -178,7 +196,8 @@ async def _post_result(request: web.Request):
     session = str(body.get("session") or "")
     # Only sessions a Live dialog started: the agent also answers Home Assistant's own pipeline, which speaks
     # its answers itself.
-    announce = session in registry.known and not registry.listening(session) and session not in registry.announced
+    announce = (session in registry.known and not registry.listening(session) and session not in registry.announced
+                and session not in registry.abandoned)
     if announce:
         registry.announced.add(session)
     log.info("result of %s: %s", session or "?", "announce it" if announce else "the dialog speaks it")

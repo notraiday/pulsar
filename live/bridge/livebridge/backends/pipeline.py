@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import time
 import weakref
 from pathlib import Path
@@ -825,14 +826,21 @@ class Dialog(Session):
         return DETACHED_NOTE
 
     async def ask_agent(self, request: str) -> str:
+        """One agent session per request, named here when the agent allows it: it is bound to this dialog before
+        the agent can ask anything. A request cancelled (dropped, cut short, the dialog gone without it) abandons
+        its session: questions from that run are not put to anyone."""
         task = asyncio.current_task()
 
         def bound(sid: str):
             _session_of[task] = sid
             surface.registry.bind(sid, self)
+        sid = f"live-{secrets.token_hex(8)}" if self.agent.names_sessions() else ""
+        if sid:
+            bound(sid)
         try:
-            return await self.agent.ask(request, on_session=bound)
+            return await self.agent.ask(request, on_session=bound, session=sid)
         except asyncio.CancelledError:
+            surface.registry.abandon(_session_of.get(task, ""), self)
             raise
         except Exception as e:
             log.warning("agent failed: %r", e)

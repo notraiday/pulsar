@@ -39,12 +39,14 @@ def test_yes_no_prefers_no():
 
 # ---- a whole dialog ----
 
-def fakes(seen, transcripts, hermes_delay=0.0, release=None):
+def fakes(seen, transcripts, hermes_delay=0.0, release=None, reply=None):
     async def chat(req):
         body = await req.json()
         seen["chat"].append(body)
         msgs = body["messages"]
-        if any("Агент закончил фоновую просьбу" in str(m.get("content")) for m in msgs):
+        if reply is not None:                      # the model answers by itself, without the agent
+            ev = {"choices": [{"delta": {"content": reply}}]}
+        elif any("Агент закончил фоновую просьбу" in str(m.get("content")) for m in msgs):
             ev = {"choices": [{"delta": {"content": "Заказ оформлен."}}]}
         elif any(m.get("role") == "tool" for m in msgs[-2:]):
             ev = {"choices": [{"delta": {"content": "Готово."}}]}
@@ -64,7 +66,9 @@ def fakes(seen, transcripts, hermes_delay=0.0, release=None):
 
     async def hermes(req):
         seen["hermes"].append((await req.json())["messages"][-1]["content"])
-        resp = web.StreamResponse(headers={"Content-Type": "text/event-stream", "X-Hermes-Session-Id": "s1"})
+        sid = req.headers.get("X-Hermes-Session-Id") or "s1"
+        seen.setdefault("sessions", []).append(sid)
+        resp = web.StreamResponse(headers={"Content-Type": "text/event-stream", "X-Hermes-Session-Id": sid})
         await resp.prepare(req)
         await resp.write(b"event: hermes.tool.progress\ndata: {\"tool\": \"browser_navigate\"}\n\n")
         if release is not None:
@@ -201,6 +205,48 @@ def test_a_long_request_goes_on_in_the_background_and_is_told_later(tmp_path, mo
     assert alive == {"announce": False} and gone == {"announce": True} and unauthorized == 401
     assert unknown == {"announce": False}          # a session no Live dialog started (HA's own pipeline)
     assert len(seen["hermes"]) == 1                # one request: the early one, detached
+    assert got[-1] == (b"X", b"idle")
+
+
+def test_a_dropped_request_asks_nobody_and_is_not_announced(tmp_path, monkeypatch, fake_vad):
+    seen = {"chat": [], "tts": [], "stt": 0, "hermes": []}
+
+    async def go():
+        release = asyncio.Event()                  # the agent's run is still going when the model has answered
+        runner, port = await serve_app(fakes(seen, ["Спроси меня, какой цвет мне нравится."], release=release,
+                                             reply="Какой цвет тебе нравится?"))
+        s_runner, s_port = await serve_app(surface.app())
+        setup(monkeypatch, port)
+        monkeypatch.setattr(agent, "HERMES_KEY", "hk")   # sessions are named by the dialog
+        routes = tmp_path / "routes.json"
+        routes.write_text(json.dumps({"default": "pipeline"}))
+        async with aiohttp.ClientSession() as http:
+            server = await bridge.serve("127.0.0.1:0", Routes(routes), http)
+            r, w = await station(server.sockets[0].getsockname()[1])
+            speak(w)
+            await frames_until(r, {b"A"})          # the model's own question
+            w.write(wire.frame(b"D"))
+            await until(lambda: surface.registry.abandoned)
+            sid = seen["sessions"][0]
+            base = f"http://127.0.0.1:{s_port}"
+            async with http.post(f"{base}/ask", json={"session": sid, "kind": "text", "text": "Какой цвет?"},
+                                 headers=AUTH) as resp:
+                ask = await resp.json()
+            async with http.get(f"{base}/ask/{ask['id']}?wait=1", headers=AUTH) as resp:
+                answer = await resp.json()
+            async with http.post(f"{base}/result", json={"session": sid, "text": "x"}, headers=AUTH) as resp:
+                result = await resp.json()
+            release.set()
+            got = await frames_until(r, {b"X"})
+            server.close()
+            await runner.cleanup()
+            await s_runner.cleanup()
+            return sid, ask, answer, result, got
+    sid, ask, answer, result, got = asyncio.run(go())
+    assert sid.startswith("live-") and len(seen["sessions"]) == 1
+    assert ask["wake"] is False and answer == {"status": "no_answer", "answer": ""}
+    assert result == {"announce": False}
+    assert seen["tts"] == ["Какой цвет тебе нравится?"]
     assert got[-1] == (b"X", b"idle")
 
 

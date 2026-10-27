@@ -12,9 +12,10 @@ tool, gpt-live's delegation). Two ways to reach it (LIVE_AGENT, or the "agent" o
 There is no fallback from one to the other: a request the chosen way cannot answer is reported to the model as failed.
 Either way the request carries HERMES_MARK, the prefix a model router in front of the agent recognises Live requests by.
 
-Hermes is asked with stream=true: its session id comes back at once (X-Hermes-Session-Id: the agent's questions to the
-owner and its late answers are routed by it, surface.py), and closing the request interrupts the agent's run there
-(a request nobody waits for any more does not go on acting).
+Hermes is asked with stream=true, each request in a session of its own that the caller names (X-Hermes-Session-Id,
+needs HERMES_KEY; without one Hermes names it from the request's text): the agent's questions to the owner and its
+late answers are routed by it (surface.py). Closing the request interrupts the agent's run there (a request nobody
+waits for any more does not go on acting).
 """
 import json
 import logging
@@ -72,12 +73,17 @@ class Agent:
                                                                if self.satellite_id or self.device_id else "")
         return "hermes (direct)"
 
-    async def ask(self, request: str, on_session=None) -> str:
-        """The agent's answer to a self-contained request; raises when there is none. `on_session(id)`: called with
-        the agent's session id as soon as it is known (hermes only)."""
+    def names_sessions(self) -> bool:
+        """Can the caller name the agent session of a request (ask(session=...))?"""
+        return self.kind == "hermes" and bool(HERMES_KEY)
+
+    async def ask(self, request: str, on_session=None, session: str = "") -> str:
+        """The agent's answer to a self-contained request; raises when there is none. `session`: the agent session
+        to run it in (names_sessions()); `on_session(id)`: called with the agent's session id as soon as it is known
+        (hermes only)."""
         t0 = time.monotonic()
         text = f"{MARK} {request}" if MARK else request
-        answer = await (self._ask_ha(text) if self.kind == "ha" else self._ask_hermes(text, on_session))
+        answer = await (self._ask_ha(text) if self.kind == "ha" else self._ask_hermes(text, on_session, session))
         answer = TAG_RE.sub("", answer).strip()
         log.info("agent %s %.1fs: %r -> %r", self.kind, time.monotonic() - t0, request[:120], answer[:160])
         return answer or "Сделано, ответ пустой."
@@ -123,9 +129,11 @@ class Agent:
             raise RuntimeError(f"home assistant: {code}: {speech}"[:300])
         return speech
 
-    async def _ask_hermes(self, text: str, on_session=None) -> str:
+    async def _ask_hermes(self, text: str, on_session=None, session: str = "") -> str:
         body = {"model": "hermes", "stream": True, "messages": [{"role": "user", "content": text}]}
         headers = {"Authorization": f"Bearer {HERMES_KEY}"} if HERMES_KEY else {}
+        if session and HERMES_KEY:
+            headers["X-Hermes-Session-Id"] = session
         async with self.http.post(HERMES_URL, json=body, headers=headers,
                                   timeout=aiohttp.ClientTimeout(total=TIMEOUT, sock_read=SILENT_S)) as r:
             if r.status != 200:
