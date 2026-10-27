@@ -32,9 +32,12 @@ END_SILENCE_MS = int(os.environ.get("LIVE_END_SILENCE_MS", "600"))
 END_SILENCE_LONG_MS = int(os.environ.get("LIVE_END_SILENCE_LONG_MS", "1400"))
 START_MS = int(os.environ.get("LIVE_START_MS", "192"))
 BARGE_MS = int(os.environ.get("LIVE_BARGE_MS", "480"))   # speech needed to cut an answer that is playing or being made
-# the owner must be this many dB louder than our own echo in the mic to count as a barge-in (else it is the station
-# hearing its own playback that the station's echo canceller did not fully remove, not the owner)
-BARGE_ECHO_MARGIN_DB = float(os.environ.get("LIVE_BARGE_ECHO_MARGIN_DB", "4"))
+# A barge-in while the answer plays must be this many dB above the cancelled/ambient floor (the level the station's
+# echo canceller leaves between sounds, measured from the non-voiced frames). Room noise and AEC leak on transients
+# sit ~5-15 dB over that floor; the owner addressing the speaker is ~20 dB over it. Lower it if real interruptions are
+# missed, raise it if noise/echo still cuts the answer.
+BARGE_FLOOR_MARGIN_DB = float(os.environ.get("LIVE_BARGE_FLOOR_MARGIN_DB", "14"))
+EFLOOR_ALPHA = 0.1  # EWMA weight for the floor estimate (~320 ms)
 MIN_SPEECH_MS = int(os.environ.get("LIVE_MIN_SPEECH_MS", "320"))
 MAX_UTT_S = float(os.environ.get("LIVE_MAX_UTT_S", "25"))
 FRAME_MS = 32
@@ -65,6 +68,8 @@ class Session:
         self.voiced_in_utt = 0
         self.silence = 0
         self.echo = [0, 0.0, 0.0, 0]    # frames, sum dBFS, max VAD p, frames over VAD_ON: mic while the station plays
+        self.echo_floor = None          # EWMA dBFS of the non-voiced mic while playing: the level the AEC leaves between sounds
+        self.echo_floor_n = 0           # frames that went into it (gate only once there is a stable estimate)
         self.quiet = [0, 0.0]           # frames, sum dBFS: mic while nothing plays and nobody talks
         self.group = None               # reminders.Group of a dialog the house started (reminder on several stations)
         self.vad_off = False            # another station of the group answers: hear nothing more
@@ -233,6 +238,10 @@ class Session:
                 e[1] += db
                 e[2] = max(e[2], p)
                 e[3] += p >= VAD_ON
+                if not voiced:  # the floor the AEC leaves between sounds; bursts are excluded so they do not raise it
+                    self.echo_floor = db if self.echo_floor is None else \
+                        EFLOOR_ALPHA * db + (1 - EFLOOR_ALPHA) * self.echo_floor
+                    self.echo_floor_n += 1
             else:
                 if self.echo[0]:
                     self.report_echo()
@@ -253,9 +262,9 @@ class Session:
             if len(recent) == need and sum(recent) >= math.ceil(need * VOICED_RATIO):
                 if self.speaking and not answering:
                     cand = sum(self.dbs[-need:]) / need
-                    base_n = self.echo[0] - need  # echo floor before this voiced run (its frames are in self.echo too)
-                    if base_n >= need and cand < (self.echo[1] - sum(self.dbs[-need:])) / base_n + BARGE_ECHO_MARGIN_DB:
-                        return  # no louder than our own echo in the mic: it is the playback, not the owner
+                    if self.echo_floor is not None and self.echo_floor_n >= need \
+                            and cand < self.echo_floor + BARGE_FLOOR_MARGIN_DB:
+                        return  # within the cancelled floor + margin: room noise or AEC leak, not the owner
                     self.barge_in(need)
                 elif busy and not answering:
                     log.info("the owner talks while the answer is being made: it waits")
