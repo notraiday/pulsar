@@ -14,6 +14,7 @@ import os
 import aiohttp
 
 from livebridge import backends
+from livebridge import surface
 from livebridge.routes import Routes
 from livebridge.util import HERE
 from livebridge.wire import Station, parse_hello, read_frame
@@ -77,6 +78,7 @@ async def main():
     routes = Routes(ROUTES)
     server = await serve(LISTEN, routes, http)
     log.info("live bridge on %s, routes %s (default backend %s)", LISTEN, ROUTES, routes.default)
+    await surface.serve()
     async with server:
         await server.serve_forever()
 

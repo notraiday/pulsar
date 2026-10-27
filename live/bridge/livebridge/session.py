@@ -89,6 +89,14 @@ class Session:
         """Background work (tool calls) that keeps the dialog open although nothing plays."""
         return False
 
+    def awaiting_answer(self) -> bool:
+        """The agent asked the owner something (surface.py): the next utterance is the answer, not a barge-in."""
+        return False
+
+    def secret_turn(self) -> bool:
+        """What the owner says now is secret (a code): its words are not logged and its sound is not dumped."""
+        return False
+
     def followup_due(self) -> bool:
         return False
 
@@ -216,16 +224,22 @@ class Session:
                 self.flags.clear()  # several stations are saying the reminder: this mic hears the others too
                 return
             busy = self.speaking or self.turn_open
-            need = (BARGE_MS if busy else START_MS) // FRAME_MS
+            answering = self.awaiting_answer()
+            need = (BARGE_MS if self.speaking or (busy and not answering) else START_MS) // FRAME_MS
             recent = self.flags[-need:]
             if len(recent) == need and sum(recent) >= math.ceil(need * VOICED_RATIO):
-                if busy:
+                if busy and not answering:
                     log.info("barge-in by voice (%s, p %.2f, %.0f dBFS)", "speaking" if self.speaking else "thinking",
                              sum(self.probs[-need:]) / need, sum(self.dbs[-need:]) / need)
                     self.dump("barge-" + ("speaking" if self.speaking else "thinking"), b"".join(self.ring),
                               self.probs, self.dbs)
                     self.echo = [0, 0.0, 0.0, 0]    # the last frames were the owner, not echo
                     self.cancel_response(flush=True)
+                elif answering and self.speaking:
+                    log.info("the owner answers over the question")
+                    self.echo = [0, 0.0, 0.0, 0]
+                    self.send(frame(b"F"))           # stop the question; the agent's work goes on
+                    self.speaking = False
                 self.utt = self.pre[-(need + LEAD_FRAMES):]
                 self.voiced_in_utt = sum(recent)
                 if self.group is not None:
@@ -249,7 +263,7 @@ class Session:
             self.silence += 1
             if (self.silence == max(1, stt.SPEC_MS // FRAME_MS) and self.spec is None and self.http is not None
                     and stt.needs_text()):
-                self.spec = self.spawn(stt.transcribe(self.http, b"".join(self.utt)))
+                self.spec = self.spawn(stt.transcribe(self.http, b"".join(self.utt), quiet=self.secret_turn()))
         if self.silence * FRAME_MS >= END_SILENCE_MS or len(self.utt) * FRAME_MS / 1000 > MAX_UTT_S:
             utt, voiced_n = self.utt, self.voiced_in_utt
             self.utt, self.pre, self.flags = None, [], []
@@ -270,13 +284,14 @@ class Session:
 
     async def rescue(self, pcm: bytes, voiced_ms: int, spec=None):
         """Too short for the VAD: the local STT decides whether it was words ("удали их") or noise."""
-        text = await spec if spec is not None else await stt.transcribe(self.http, pcm)
+        text = await spec if spec is not None else await stt.transcribe(self.http, pcm, quiet=self.secret_turn())
         if stt.has_words(text) and not self.vad_off and not self.ending:
-            log.info("short utterance kept (%d ms voiced): %r", voiced_ms, text)
+            log.info("short utterance kept (%d ms voiced): %s", voiced_ms, "(not logged)" if self.secret_turn() else repr(text))
             self.dump("utt", pcm)
             self.on_utterance(pcm, text)
         else:
-            log.info("ignored a short noise (%d ms voiced)%s", voiced_ms, f", heard {text!r}" if text else "")
+            log.info("ignored a short noise (%d ms voiced)%s", voiced_ms,
+                     f", heard {text!r}" if text and not self.secret_turn() else "")
             self.dump("noise", pcm)
 
     def report_echo(self):
@@ -292,7 +307,7 @@ class Session:
 
     def dump(self, kind: str, pcm: bytes, probs=None, dbs=None):
         """Debug aid (LIVE_DUMP_DIR): keep the sound that made a decision, so it can be listened to and re-run."""
-        if not DUMP_DIR:
+        if not DUMP_DIR or self.secret_turn():
             return
         try:
             d = Path(DUMP_DIR)

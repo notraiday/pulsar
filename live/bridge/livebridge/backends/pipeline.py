@@ -15,6 +15,11 @@ The first turn of a dialog the owner opened has nothing before it to resolve: it
 self-contained request. The agent is asked with it at once, beside the model's round; when the model asks the agent
 too (nearly every first turn is a command), it gets that request's answer, ~0.5 s sooner (LIVE_AGENT_RACE=0: off).
 
+An agent request still running after LIVE_AGENT_DETACH_S goes on in the background: the owner hears that it is being
+done and the dialog may end. Its answer is spoken in the dialog if that is still open; otherwise the agent side
+announces it (surface.py /result). Questions the agent asks the owner meanwhile (codes, yes / no) are spoken here when
+this dialog started its session; the reply goes back to the agent only (no model round, no history).
+
 Zero data retention (util.ZDR, on unless LIVE_ZDR=0): every OpenRouter request (model and TTS) carries
 provider.zdr, and the default endpoints of each model are ZDR ones (Gemini: Vertex only, AI Studio keeps data).
 
@@ -28,11 +33,12 @@ import logging
 import os
 import re
 import time
+import weakref
 from pathlib import Path
 
 import aiohttp
 
-from .. import reminders, stt
+from .. import reminders, stt, surface
 from ..agent import Agent
 from ..session import Session
 from ..util import ZDR, BackendUnavailable, HERE, clean_for_speech, read_instructions, wav16k
@@ -59,6 +65,13 @@ LLM_TIMEOUT = float(os.environ.get("LIVE_LLM_TIMEOUT", "60"))
 LLM_HEDGE_S = float(os.environ.get("LIVE_LLM_HEDGE_S", "1.5"))  # nothing useful from the model after this long: race a 2nd identical request (0 = off)
 TTS_HEDGE_S = float(os.environ.get("LIVE_TTS_HEDGE_S", "0.8"))  # no audio after this long: race a 2nd TTS request (0 = off)
 AGENT_RACE = os.environ.get("LIVE_AGENT_RACE", "1") != "0"  # first turn: the agent is asked with the transcript at once
+DETACH_S = float(os.environ.get("LIVE_AGENT_DETACH_S", "20"))  # an agent request still running this long goes on in the background (0 = never)
+DETACHED_NOTE = ("Агент продолжает эту задачу в фоне. Если ему понадобится код или подтверждение, он сам спросит хозяина "
+                 "через колонку, а результат скажет, когда закончит.")
+DETACHED_SPEECH = "Это надолго — занимаюсь, позову, если что-то понадобится."
+ACKS = {"code": "Принято, ввожу.", "yes": "Хорошо.", "no": "Поняла, не делаю.", "text": "Поняла."}
+_background: set = set()  # detached agent requests: they outlive their dialog
+_session_of: "weakref.WeakKeyDictionary[asyncio.Task, str]" = weakref.WeakKeyDictionary()  # agent request -> agent session
 ZDR_PROVIDER = {"zdr": True, "data_collection": "deny"}
 COVERED = object()  # run_call: the first ask of the round got the whole utterance
 
@@ -172,6 +185,8 @@ class Dialog(Session):
         self.notes = []        # late results waiting for the next model round
         self.carry = False     # the next answer has to cover results the owner has not heard yet
         self.asked = {}        # call id -> the agent request, for notes about results the owner has not heard
+        self.questions = []    # surface.Ask the agent asked the owner, the first one is being asked
+        self.woken = False     # the house opened this dialog to ask the owner something (surface.py)
 
     async def open(self):
         if not OR_KEY:
@@ -190,7 +205,15 @@ class Dialog(Session):
             self.instructions += TEXT_NOTE
         reminder = clean_for_speech(str(self.st.hello.get("reminder") or ""))
         if reminder:
-            self.instructions += REMINDER_NOTE.format(text=reminder)
+            a = surface.registry.for_wake(reminder)
+            if a is not None:  # the agent's question: the group says it, the answer goes back to the agent
+                self.woken = True
+                a.asked = True
+                a.holders.add(self)
+                self.questions.append(a)
+                log.info("dialog opened for ask %s (%s)", a.id, a.kind)
+            else:
+                self.instructions += REMINDER_NOTE.format(text=reminder)
             reminders.join(self, reminder, self.tts_chunks)
 
     async def prewarm(self):
@@ -217,7 +240,87 @@ class Dialog(Session):
             if pending is not None:
                 pending.cancel()
             return  # another station of the reminder answers
+        if self.awaiting_answer():
+            self.spawn(self.answer(self.questions[0], pcm, text, pending))
+            return
         self.start_response(pcm, text, pending)
+
+    async def close(self):
+        """The dialog is over: agent requests it was waiting for stop (closing the request interrupts the agent);
+        detached ones go on. A question nobody else can take any more gets no answer."""
+        for t in self.tools.values():
+            if not t.done():
+                t.cancel()
+        for a in self.questions:
+            a.holders.discard(self)
+            if not a.holders:
+                a.resolve("no_answer")
+
+    # ---- the agent's questions to the owner (surface.py) ----
+    def awaiting_answer(self) -> bool:
+        return bool(self.questions) and self.questions[0].asked and not self.questions[0].future.done()
+
+    def secret_turn(self) -> bool:
+        return bool(self.questions) and self.questions[0].asked and self.questions[0].secret
+
+    def take_ask(self, a) -> bool:
+        """Called by the registry: ask `a` in this dialog (after the questions already waiting)."""
+        if self.ending or self.st.closing:
+            return False
+        a.holders.add(self)
+        self.questions.append(a)
+        if len(self.questions) == 1:
+            self.spawn(self.pose(a))
+        return True
+
+    async def pose(self, a, prefix: str = ""):
+        for _ in range(40):  # let what is playing finish (at most ~10 s)
+            if not self.speaking:
+                break
+            await asyncio.sleep(0.25)
+        a.asked = True
+        self.touch()
+        await self.say(prefix + a.text)
+        if not self.turn_open:
+            self.set_state("listening")
+
+    async def say(self, text: str):
+        async for pcm in self.tts_chunks(text):
+            self.speaking = True
+            self.touch()
+            self.set_state("speaking")
+            self.send(frame(b"A", pcm))
+            await self.st.drain()
+
+    async def answer(self, a, pcm: bytes, text: str | None, pending):
+        """The owner's reply to question `a`: parsed and handed to the agent; never a model turn."""
+        if text is None:
+            text = await pending if pending is not None else await stt.transcribe(self.http, pcm, quiet=a.secret)
+        if a.future.done():  # timed out meanwhile
+            self.next_question()
+            return
+        status, value = a.parse(text or "")
+        if status == "unclear" and a.tries < 1:
+            a.tries += 1
+            log.info("ask %s: answer unclear, asking again", a.id)
+            await self.pose(a, "Не расслышала. ")
+            return
+        a.resolve(status, value)
+        log.info("ask %s answered: %s", a.id, status if a.secret else f"{status} {value[:80]!r}")
+        self.next_question()
+        ack = ACKS.get(value if a.kind == "confirm" else a.kind, "") if status == "answered" else "Не поняла, пропускаю."
+        if ack:
+            await self.say(ack)
+        if self.questions:
+            self.spawn(self.pose(self.questions[0]))
+        elif self.woken:
+            self.ending = "answered"
+        elif not self.turn_open and not self.speaking:
+            self.set_state("listening")
+
+    def next_question(self):
+        if self.questions:
+            self.questions.pop(0).holders.discard(self)
 
     # ---- reply ----
     # ---- tool calls that survive an interruption ----
@@ -435,6 +538,8 @@ class Dialog(Session):
         if (not DIRECT_MAX or self.carry or len(calls) != 1 or calls[0]["name"] != "ask_hermes"
                 or self.has_unspoken_results()):  # an earlier interrupted request is ready: let the model say both
             return ""
+        if results[0] == DETACHED_NOTE:
+            return DETACHED_SPEECH
         text = clean_for_speech(results[0])
         if not text or len(text) > DIRECT_MAX or text.startswith(("Агент не ответил", "Сделано, ответ пустой")):
             return ""
@@ -679,15 +784,51 @@ class Dialog(Session):
                 self.set_state("thinking")
             if early is COVERED:
                 return "Сделано вместе с первой просьбой: агент получил всю реплику хозяина целиком."
+            request = str(args.get("request", ""))
             if early is not None:
                 log.info("the model asked the agent: it gets the request already running")
-                return await early
-            return await self.ask_agent(str(args.get("request", "")))
+                task = early
+            else:
+                task = asyncio.create_task(self.ask_agent(request))
+            return await self.wait_or_detach(task, request)
         return f"unknown tool {c['name']}"
 
-    async def ask_agent(self, request: str) -> str:
+    async def wait_or_detach(self, task: asyncio.Task, request: str) -> str:
+        """The agent's answer, or DETACHED_NOTE when it takes longer than DETACH_S: the request then goes on in the
+        background (it is no longer this dialog's to cancel) and its answer comes as a note, or as an
+        announcement once the dialog is gone."""
         try:
-            return await self.agent.ask(request)
+            if DETACH_S <= 0:
+                return await asyncio.shield(task)
+            done, _ = await asyncio.wait({task}, timeout=DETACH_S)
+            if task in done:
+                return task.result()
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+        self.bg.discard(task)
+        _background.add(task)
+        sid = _session_of.get(task, "")
+        surface.registry.detach(sid)
+        log.info("agent request still running after %.0fs, it goes on in the background (session %s)", DETACH_S,
+                 sid or "?")
+
+        def finished(t: asyncio.Task):
+            _background.discard(t)
+            if t.cancelled() or self.ending or self.st.closing:
+                return  # the agent side announces it (surface /result)
+            self.notes.append(f"(Агент закончил фоновую просьбу «{request}»: {self.tool_text(t)} Расскажи хозяину.)")
+        task.add_done_callback(finished)
+        return DETACHED_NOTE
+
+    async def ask_agent(self, request: str) -> str:
+        task = asyncio.current_task()
+
+        def bound(sid: str):
+            _session_of[task] = sid
+            surface.registry.bind(sid, self)
+        try:
+            return await self.agent.ask(request, on_session=bound)
         except asyncio.CancelledError:
             raise
         except Exception as e:

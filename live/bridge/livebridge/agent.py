@@ -11,6 +11,10 @@ tool, gpt-live's delegation). Two ways to reach it (LIVE_AGENT, or the "agent" o
 
 There is no fallback from one to the other: a request the chosen way cannot answer is reported to the model as failed.
 Either way the request carries HERMES_MARK, the prefix a model router in front of the agent recognises Live requests by.
+
+Hermes is asked with stream=true: its session id comes back at once (X-Hermes-Session-Id: the agent's questions to the
+owner and its late answers are routed by it, surface.py), and closing the request interrupts the agent's run there
+(a request nobody waits for any more does not go on acting).
 """
 import json
 import logging
@@ -24,7 +28,8 @@ from .util import TAG_RE, BackendUnavailable
 log = logging.getLogger("live")
 
 AGENT = os.environ.get("LIVE_AGENT", "hermes")
-TIMEOUT = float(os.environ.get("LIVE_AGENT_TIMEOUT") or os.environ.get("HERMES_TIMEOUT") or "120")
+TIMEOUT = float(os.environ.get("LIVE_AGENT_TIMEOUT") or os.environ.get("HERMES_TIMEOUT") or "1800")  # background tasks included
+SILENT_S = float(os.environ.get("LIVE_AGENT_SILENT_S", "900"))  # nothing at all from the agent this long (it may wait for the owner)
 # Prefix that tells a router in front of the agent: this is a live voice request (cloud model, fast path). "" = none.
 MARK = os.environ.get("HERMES_MARK", "@@LIVE@@")
 
@@ -67,11 +72,12 @@ class Agent:
                                                                if self.satellite_id or self.device_id else "")
         return "hermes (direct)"
 
-    async def ask(self, request: str) -> str:
-        """The agent's answer to a self-contained request; raises when there is none."""
+    async def ask(self, request: str, on_session=None) -> str:
+        """The agent's answer to a self-contained request; raises when there is none. `on_session(id)`: called with
+        the agent's session id as soon as it is known (hermes only)."""
         t0 = time.monotonic()
         text = f"{MARK} {request}" if MARK else request
-        answer = await (self._ask_ha(text) if self.kind == "ha" else self._ask_hermes(text))
+        answer = await (self._ask_ha(text) if self.kind == "ha" else self._ask_hermes(text, on_session))
         answer = TAG_RE.sub("", answer).strip()
         log.info("agent %s %.1fs: %r -> %r", self.kind, time.monotonic() - t0, request[:120], answer[:160])
         return answer or "Сделано, ответ пустой."
@@ -117,10 +123,41 @@ class Agent:
             raise RuntimeError(f"home assistant: {code}: {speech}"[:300])
         return speech
 
-    async def _ask_hermes(self, text: str) -> str:
-        body = {"model": "hermes", "stream": False, "messages": [{"role": "user", "content": text}]}
+    async def _ask_hermes(self, text: str, on_session=None) -> str:
+        body = {"model": "hermes", "stream": True, "messages": [{"role": "user", "content": text}]}
         headers = {"Authorization": f"Bearer {HERMES_KEY}"} if HERMES_KEY else {}
-        status, data = await self._post(HERMES_URL, body, headers)
-        if status != 200 or not isinstance(data, dict):
-            raise RuntimeError(f"hermes HTTP {status}: {str(data)[:200]}")
-        return data["choices"][0]["message"].get("content") or ""
+        async with self.http.post(HERMES_URL, json=body, headers=headers,
+                                  timeout=aiohttp.ClientTimeout(total=TIMEOUT, sock_read=SILENT_S)) as r:
+            if r.status != 200:
+                raise RuntimeError(f"hermes HTTP {r.status}: {(await r.text())[:200]}")
+            sid = r.headers.get("X-Hermes-Session-Id", "")
+            if sid and on_session is not None:
+                on_session(sid)
+            if "event-stream" not in r.headers.get("Content-Type", ""):  # a server that answers in one piece
+                data = json.loads(await r.text())
+                return data["choices"][0]["message"].get("content") or ""
+            answer, event = "", ""
+            async for raw in r.content:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line:
+                    event = ""
+                    continue
+                if line.startswith("event:"):
+                    event = line[6:].strip()  # hermes.tool.progress and friends: not part of the answer
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                if event and event != "message":
+                    continue
+                try:
+                    ev = json.loads(data)
+                except ValueError:
+                    continue
+                if ev.get("error"):
+                    raise RuntimeError(f"hermes: {str(ev['error'])[:200]}")
+                for ch in ev.get("choices") or []:
+                    answer += (ch.get("delta") or {}).get("content") or ""
+            return answer

@@ -47,8 +47,9 @@ def has_words(text: str | None) -> bool:
     return bool(text and WORD_RE.search(text))
 
 
-async def transcribe(http: aiohttp.ClientSession, pcm: bytes) -> str | None:
-    """The transcript of 16 kHz s16 mono `pcm`; None when there is no STT or it failed (logged)."""
+async def transcribe(http: aiohttp.ClientSession, pcm: bytes, quiet: bool = False) -> str | None:
+    """The transcript of 16 kHz s16 mono `pcm`; None when there is no STT or it failed (logged). `quiet`: the
+    words are not logged (the answer to a question for a code, surface.py)."""
     if not URL or http is None:
         return None
     form = aiohttp.FormData()
@@ -70,5 +71,5 @@ async def transcribe(http: aiohttp.ClientSession, pcm: bytes) -> str | None:
         log.warning("stt failed after %.2fs: %r", time.monotonic() - t0, e)
         return None
     text = str((data or {}).get("text") or "").strip()
-    log.info("stt %.2fs: %r", time.monotonic() - t0, text[:200])
+    log.info("stt %.2fs: %s", time.monotonic() - t0, f"({len(text)} chars, not logged)" if quiet else repr(text[:200]))
     return text
