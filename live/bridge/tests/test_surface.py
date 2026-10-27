@@ -189,13 +189,17 @@ def test_a_long_request_goes_on_in_the_background_and_is_told_later(tmp_path, mo
                 gone = await resp.json()
             async with http.post(f"http://127.0.0.1:{s_port}/result", json={"session": "s1"}) as resp:
                 unauthorized = resp.status
+            async with http.post(f"http://127.0.0.1:{s_port}/result", json={"session": "ha-pipeline"},
+                                 headers=AUTH) as resp:
+                unknown = await resp.json()
             server.close()
             await runner.cleanup()
             await s_runner.cleanup()
-            return alive, gone, unauthorized, got
-    alive, gone, unauthorized, got = asyncio.run(go())
+            return alive, gone, unauthorized, unknown, got
+    alive, gone, unauthorized, unknown, got = asyncio.run(go())
     assert seen["tts"] == [pipeline.DETACHED_SPEECH, "Заказ оформлен."]
     assert alive == {"announce": False} and gone == {"announce": True} and unauthorized == 401
+    assert unknown == {"announce": False}          # a session no Live dialog started (HA's own pipeline)
     assert len(seen["hermes"]) == 1                # one request: the early one, detached
     assert got[-1] == (b"X", b"idle")
 

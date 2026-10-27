@@ -12,8 +12,9 @@ The agent side (a Hermes plugin) talks to it over HTTP (LIVE_SURFACE_LISTEN, bea
   GET  /ask/ID?wait=S                -> {"status": "answered"|"unclear"|"timeout"|"pending", "answer"}
                 "code": the digits; "confirm": "yes" | "no"; "text": the transcript.
   POST /result  {"session", "text"}  -> {"announce": bool}
-                The agent is about to answer: true when nobody is listening for it any more (the dialog that
-                asked has ended, or the request was detached into the background), so the caller announces it.
+                The agent is about to answer: true when a Live dialog started that session and nobody is listening
+                for it any more (the dialog has ended), so the caller announces it. Sessions the bridge never saw
+                (Home Assistant's own pipeline) are never announced.
 
 Agent sessions are bound to dialogs by the X-Hermes-Session-Id the agent returns (agent.py).
 """
@@ -75,6 +76,7 @@ class Registry:
     def __init__(self):
         self.dialogs: "weakref.WeakValueDictionary[str, object]" = weakref.WeakValueDictionary()  # session -> dialog
         self.detached: set[str] = set()
+        self.known: set[str] = set()      # sessions a dialog started: only theirs are ever announced
         self.announced: set[str] = set()
         self.asks: dict[str, Ask] = {}
 
@@ -82,6 +84,7 @@ class Registry:
     def bind(self, session: str, dialog):
         if session:
             self.dialogs[session] = dialog
+            self.known.add(session)
 
     def detach(self, session: str):
         if session:
@@ -173,7 +176,9 @@ async def _get_ask(request: web.Request):
 async def _post_result(request: web.Request):
     body = await request.json()
     session = str(body.get("session") or "")
-    announce = bool(session) and not registry.listening(session) and session not in registry.announced
+    # Only sessions a Live dialog started: the agent also answers Home Assistant's own pipeline, which speaks
+    # its answers itself.
+    announce = session in registry.known and not registry.listening(session) and session not in registry.announced
     if announce:
         registry.announced.add(session)
     log.info("result of %s: %s", session or "?", "announce it" if announce else "the dialog speaks it")

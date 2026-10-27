@@ -1,0 +1,27 @@
+name: voice-surface
+label: Live speakers as the voice agent's way to the owner
+version: "0.1.0"
+description: >-
+  Voice (api_server) sessions cannot ask anyone anything, so one-time codes, card confirmations and questions
+  were refused. This routes them to the Live bridge (pulsar live/bridge, surface.py), which asks the owner through
+  the speakers and returns only the parsed answer (a code is typed into the page by Hermes and never reaches the
+  model). Also: the ask_owner tool, the Bitwarden session from hermes-bw-unlock (RAM only), Bitwarden cards and
+  identities as payment / address vault items, and announcing answers of requests whose Live dialog has ended.
+author: local
+config_schema:
+  bridge_url:
+    type: str
+    default: "http://192.168.1.125:10702"
+    description: The Live bridge's owner surface (LIVE_SURFACE_LISTEN)
+  profile:
+    type: str
+    default: "voice"
+    description: Only sessions of this Hermes profile use the speakers
+  wake_script:
+    type: str
+    default: "script.live_reminder"
+    description: Home Assistant script that makes the speakers start a dialog with a text (field "message")
+hooks:
+  - post_llm_call
+provides_tools:
+  - ask_owner

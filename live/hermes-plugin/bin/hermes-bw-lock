@@ -1,0 +1,9 @@
+#!/bin/sh
+# Lock Vaultwarden for the Hermes agent: drop the session hermes-bw-unlock left in RAM and lock the bw CLI.
+set -eu
+U=hermes
+UID_=$(id -u "$U")
+rm -f "/run/user/$UID_/hermes-bw/session"
+runuser -u "$U" -- env HOME="$(getent passwd "$U" | cut -d: -f6)" \
+  PATH="/home/$U/.local/bin:/home/$U/.hermes/tools/node-26.7.0-linux-x64/bin:/usr/bin:/bin" bw lock >/dev/null 2>&1 || true
+echo "Vaultwarden locked for Hermes."

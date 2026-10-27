@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""Unlock Vaultwarden for the Hermes agent until the next reboot (or hermes-bw-lock).
+
+Run as root on the Hermes host. Asks for the master password (not echoed, not stored); `bw unlock` turns it into a
+session token, which is all that is kept: in RAM, /run/user/<hermes uid>/hermes-bw/session, readable by hermes only.
+The voice-surface plugin hands that session to Hermes's Bitwarden backend. `--login` runs `bw login` first (once).
+"""
+import getpass
+import os
+import pwd
+import subprocess
+import sys
+
+USER = "hermes"
+pw = pwd.getpwnam(USER)
+DIR = f"/run/user/{pw.pw_uid}/hermes-bw"
+ENV = {"HOME": pw.pw_dir, "LANG": "C.UTF-8",
+       "PATH": f"{pw.pw_dir}/.local/bin:{pw.pw_dir}/.hermes/tools/node-26.7.0-linux-x64/bin:/usr/bin:/bin"}
+
+
+def bw(*args, env=None, interactive=False):
+    kw = {} if interactive else {"capture_output": True, "text": True}
+    return subprocess.run(["bw", *args], user=pw.pw_uid, group=pw.pw_gid, env=dict(ENV, **(env or {})), **kw)
+
+
+if os.geteuid() != 0:
+    sys.exit("run as root (sudo hermes-bw-unlock)")
+if "--login" in sys.argv[1:]:
+    if bw("login", interactive=True).returncode != 0:
+        sys.exit("bw login failed")
+status = bw("status").stdout
+if '"unauthenticated"' in status:
+    sys.exit("Vaultwarden is not logged in on this host: run  hermes-bw-unlock --login")
+master = getpass.getpass("Vaultwarden master password: ")
+r = bw("unlock", "--raw", "--nointeraction", "--passwordenv", "HERMES_BW_MASTER", env={"HERMES_BW_MASTER": master})
+del master
+token = (r.stdout or "").strip()
+if r.returncode != 0 or not token:
+    sys.exit("unlock failed: " + (r.stderr or r.stdout or "").strip()[:200])
+os.makedirs(DIR, mode=0o700, exist_ok=True)
+os.chown(DIR, pw.pw_uid, pw.pw_gid)
+path = os.path.join(DIR, "session")
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    f.write(token)
+os.chown(path, pw.pw_uid, pw.pw_gid)
+bw("sync", env={"BW_SESSION": token})
+print("Vaultwarden unlocked for Hermes until reboot or hermes-bw-lock.")
