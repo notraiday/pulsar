@@ -143,10 +143,12 @@ ANNOUNCED_NOTE = (
     "подтвердил («ок», «спасибо», «понял») — сразу вызови end_dialog.")
 # How the house's announcement of a finished job is written (summarize()).
 SUMMARY_NOTE = (
-    "\n\nСейчас ты сама начинаешь разговор: ты закончила дело хозяина и говоришь ему итог. Одна-две короткие фразы "
-    "по-русски, от первого лица, главное: что сделано, ключевые цифры, сроки или время. Без списков длиннее трёх "
-    "пунктов (подробности хозяин спросит сам), без слов «агент», «задача номер», без английского. Если от хозяина "
-    "что-то нужно — короткий вопрос в конце. Ответ — только то, что ты скажешь вслух.")
+    "\n\nСейчас ты сама начинаешь разговор: ты закончила дело хозяина и коротко говоришь ему итог. Не больше двух "
+    "коротких фраз, до двадцати пяти слов, по-русски, от первого лица: что получилось и одно самое важное (цифра, "
+    "срок, время). Ничего не перечисляй и не зачитывай данные: если итог — список или много цифр, скажи, что "
+    "готово и сколько, и предложи рассказать подробнее. Без слов «агент», «задача номер», без английского. Нужен "
+    "ответ хозяина — короткий вопрос в конце. Ответ — только то, что ты скажешь вслух.")
+SUMMARY_MAX = 260  # chars; a longer one is cut after its second sentence
 
 SENT_RE = re.compile(r"(.+?[.!?…]+[\"»)]?)(?:\s+|$)", re.S)
 
@@ -996,7 +998,7 @@ async def summarize(request: str, result: str) -> str:
     fallback = clean_for_speech(TAG_RE.sub("", result))[:400] or "Готово."
     if not OR_KEY:
         return fallback
-    body = {"model": LLM, "stream": False, "messages": [
+    body = {"model": LLM, "stream": False, "max_tokens": 160, "messages": [
         {"role": "system", "content": read_instructions() + SUMMARY_NOTE},
         {"role": "user", "content": f"Просьба хозяина: «{request[:400]}»\nЧем кончилось (твои рабочие заметки): "
                                     f"{result[:3000]}"}]}
@@ -1016,7 +1018,10 @@ async def summarize(request: str, result: str) -> str:
     except Exception as e:
         log.warning("summary failed (%r): announcing the result as it is", e)
         return fallback
-    log.info("summary %.1fs: %r", time.monotonic() - t0, text[:200])
+    if len(text) > SUMMARY_MAX:
+        sentences = [m.group(1).strip() for m in SENT_RE.finditer(text)]
+        text = " ".join(sentences[:2]) if sentences else text[:SUMMARY_MAX]
+    log.info("summary %.1fs: %r", time.monotonic() - t0, text)
     return text or fallback
 
 
