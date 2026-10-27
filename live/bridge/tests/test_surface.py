@@ -628,3 +628,51 @@ def test_with_no_dialog_the_speakers_are_woken_and_the_loudest_answers(tmp_path,
     assert len(seen["tts"]) == 2
     assert seen["chat"] == [] and seen["hermes"] == []   # nothing went to a model or the agent
     assert got[-1] == (b"X", b"answered")
+
+
+# ---- the browser autopilot's decisions ----
+
+def test_decide_forwards_to_jev_with_zdr_and_needs_the_token(monkeypatch):
+    seen = {}
+
+    async def decisions(req):
+        seen["body"] = await req.json()
+        seen["auth"] = req.headers.get("Authorization")
+        return web.json_response({"answers": {"operation": {"type": "choice", "choice": "CLICK", "confidence": 0.97}},
+                                  "usage": {"input_tokens": 900}})
+
+    async def main():
+        fake = web.Application()
+        fake.router.add_post("/api/alpha/decisions", decisions)
+        fake_runner, fake_port = await serve_app(fake)
+        monkeypatch.setattr(pipeline, "OR_BASE", f"http://127.0.0.1:{fake_port}/api/v1")
+        monkeypatch.setattr(pipeline, "OR_KEY", "or-key")
+        monkeypatch.setattr(pipeline, "OR_PROXY", None)
+        monkeypatch.setattr(surface, "TOKEN", "surface-token")
+        runner, port = await serve_app(surface.app())
+        try:
+            async with aiohttp.ClientSession() as http:
+                url = f"http://127.0.0.1:{port}/decide"
+                req = {"state": {"goal": "x", "elements": ["[1] button \"Купить\""]},
+                       "questions": {"operation": {"type": "choice", "criteria": {"CLICK": "click", "DONE": "done"}}}}
+                async with http.post(url, json=req) as r:
+                    assert r.status == 401
+                async with http.post(url, json={"state": {}}, headers=AUTH) as r:
+                    assert r.status == 400
+                async with http.post(url, json=req, headers=AUTH) as r:
+                    assert r.status == 200
+                    out = await r.json()
+        finally:
+            await runner.cleanup()
+            await fake_runner.cleanup()
+            if surface._decide_http is not None:
+                await surface._decide_http.close()
+                surface._decide_http = None
+        return out
+
+    out = asyncio.run(main())
+    assert out["answers"]["operation"]["choice"] == "CLICK"
+    assert seen["body"]["model"] == surface.JEV_MODEL
+    assert seen["body"]["provider"] == {"zdr": True, "data_collection": "deny"}
+    assert seen["body"]["state"]["goal"] == "x"
+    assert seen["auth"] == "Bearer or-key"

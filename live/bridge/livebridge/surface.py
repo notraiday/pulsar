@@ -22,6 +22,9 @@ The agent side (a Hermes plugin) talks to it over HTTP (LIVE_SURFACE_LISTEN, bea
   GET  /session/ID                   -> {"background": bool, "think": bool}
                 The request went on in the background (nobody waits for it), or is a website task: the agent
                 may think longer.
+  POST /decide  {"state", "questions"} -> {"answers", "usage", "seconds"}
+                The agent's browser autopilot asks Jev (a decision model) for its next step; forwarded to
+                OpenRouter's decisions API with this bridge's key and proxy, ZDR as everywhere (LIVE_JEV_MODEL).
 
 Agent sessions are bound to dialogs by their X-Hermes-Session-Id: the dialog names each request's session (agent.py).
 Requests running in the background and website tasks are jobs, listed for every dialog for a while (what was asked,
@@ -36,6 +39,7 @@ import os
 import time
 import weakref
 
+import aiohttp
 from aiohttp import web
 
 from . import phrases, spoken
@@ -46,6 +50,7 @@ log = logging.getLogger("live")
 LISTEN = os.environ.get("LIVE_SURFACE_LISTEN", "")      # e.g. 0.0.0.0:10702; "" = off
 TOKEN = os.environ.get("LIVE_SURFACE_TOKEN", "")
 ASK_TIMEOUT_S = float(os.environ.get("LIVE_ASK_TIMEOUT_S", "120"))
+JEV_MODEL = os.environ.get("LIVE_JEV_MODEL", "typesafe/jev-1.14")   # on OpenRouter's ZDR endpoint list
 KINDS = ("code", "confirm", "text")
 
 _ids = itertools.count(1)
@@ -412,12 +417,48 @@ async def _get_session(request: web.Request):
     return web.json_response({"background": sid in registry.detached, "think": sid in registry.think})
 
 
+_decide_http: aiohttp.ClientSession | None = None
+
+
+async def _post_decide(request: web.Request):
+    """One step of the agent's browser autopilot: Jev (a decision model) picks the next action. Goes to OpenRouter's
+    decisions API with this bridge's key, proxy and ZDR settings, so the key never leaves the bridge."""
+    global _decide_http
+    from .backends import pipeline
+    from .util import ZDR
+    body = await request.json()
+    if not isinstance(body.get("state"), (dict, list, str)) or not isinstance(body.get("questions"), dict):
+        return web.json_response({"error": "state and questions are required"}, status=400)
+    req = {"model": JEV_MODEL, "state": body["state"], "questions": body["questions"]}
+    if ZDR:
+        req["provider"] = dict(pipeline.ZDR_PROVIDER)
+    if _decide_http is None or _decide_http.closed:
+        _decide_http = aiohttp.ClientSession()
+    url = pipeline.OR_BASE.rsplit("/v1", 1)[0] + "/alpha/decisions"
+    t = time.monotonic()
+    try:
+        async with _decide_http.post(url, json=req, headers=pipeline.or_headers(), proxy=pipeline.OR_PROXY,
+                                     timeout=aiohttp.ClientTimeout(total=20)) as r:
+            data = await r.json(content_type=None)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+        log.warning("decide: %r", e)
+        return web.json_response({"error": f"decisions request failed: {e!r}"[:300]}, status=502)
+    dt = time.monotonic() - t
+    if r.status != 200 or not isinstance(data, dict):
+        log.warning("decide: HTTP %s %s", r.status, str(data)[:200])
+        return web.json_response({"error": f"decisions HTTP {r.status}", "detail": str(data)[:300]}, status=502)
+    op = (data.get("answers") or {}).get("operation") or {}
+    log.info("decide %.2fs: %s (%.2f)", dt, op.get("choice"), op.get("confidence") or 0)
+    return web.json_response({"answers": data.get("answers") or {}, "usage": data.get("usage"), "seconds": round(dt, 3)})
+
+
 def app() -> web.Application:
     a = web.Application(middlewares=[_auth])
     a.router.add_post("/ask", _post_ask)
     a.router.add_get("/ask/{id}", _get_ask)
     a.router.add_post("/result", _post_result)
     a.router.add_get("/session/{id}", _get_session)
+    a.router.add_post("/decide", _post_decide)
     return a
 
 
