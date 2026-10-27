@@ -77,13 +77,13 @@ class Agent:
         """Can the caller name the agent session of a request (ask(session=...))?"""
         return self.kind == "hermes" and bool(HERMES_KEY)
 
-    async def ask(self, request: str, on_session=None, session: str = "") -> str:
+    async def ask(self, request: str, on_session=None, session: str = "", on_progress=None) -> str:
         """The agent's answer to a self-contained request; raises when there is none. `session`: the agent session
-        to run it in (names_sessions()); `on_session(id)`: called with the agent's session id as soon as it is known
-        (hermes only)."""
+        to run it in (names_sessions()); `on_session(id)`: called with the agent's session id as soon as it is known;
+        `on_progress(step)`: each tool the agent starts, as its own one-line preview (hermes only)."""
         t0 = time.monotonic()
         text = f"{MARK} {request}" if MARK else request
-        answer = await (self._ask_ha(text) if self.kind == "ha" else self._ask_hermes(text, on_session, session))
+        answer = await (self._ask_ha(text) if self.kind == "ha" else self._ask_hermes(text, on_session, session, on_progress))
         answer = TAG_RE.sub("", answer).strip()
         log.info("agent %s %.1fs: %r -> %r", self.kind, time.monotonic() - t0, request[:120], answer[:160])
         return answer or "Сделано, ответ пустой."
@@ -129,7 +129,7 @@ class Agent:
             raise RuntimeError(f"home assistant: {code}: {speech}"[:300])
         return speech
 
-    async def _ask_hermes(self, text: str, on_session=None, session: str = "") -> str:
+    async def _ask_hermes(self, text: str, on_session=None, session: str = "", on_progress=None) -> str:
         body = {"model": "hermes", "stream": True, "messages": [{"role": "user", "content": text}]}
         headers = {"Authorization": f"Bearer {HERMES_KEY}"} if HERMES_KEY else {}
         if session and HERMES_KEY:
@@ -163,6 +163,13 @@ class Agent:
                     break
                 if event == "hermes.tool.progress":
                     said, answer = (answer if answer.strip() else said), ""
+                    if on_progress is not None:
+                        try:
+                            ev = json.loads(data)
+                        except ValueError:
+                            ev = {}
+                        if isinstance(ev, dict) and ev.get("status", "running") == "running":
+                            on_progress(str(ev.get("label") or ev.get("tool") or ""))
                     continue
                 if event and event != "message":
                     continue

@@ -39,12 +39,14 @@ def test_yes_no_prefers_no():
 
 # ---- a whole dialog ----
 
-def fakes(seen, transcripts, hermes_delay=0.0, release=None, reply=None):
+def fakes(seen, transcripts, hermes_delay=0.0, release=None, reply=None, model=None):
     async def chat(req):
         body = await req.json()
         seen["chat"].append(body)
         msgs = body["messages"]
-        if reply is not None:                      # the model answers by itself, without the agent
+        if model is not None and (ev := model(body)) is not None:
+            pass
+        elif reply is not None:                    # the model answers by itself, without the agent
             ev = {"choices": [{"delta": {"content": reply}}]}
         elif any("Агент закончил фоновую просьбу" in str(m.get("content")) for m in msgs):
             ev = {"choices": [{"delta": {"content": "Заказ оформлен."}}]}
@@ -248,6 +250,114 @@ def test_a_dropped_request_asks_nobody_and_is_not_announced(tmp_path, monkeypatc
     assert result == {"announce": False}
     assert seen["tts"] == ["Какой цвет тебе нравится?"]
     assert got[-1] == (b"X", b"idle")
+
+
+async def background_request(http, server, seen):
+    """A dialog whose request goes on in the background, then ends; the agent session of that request."""
+    r, w = await station(server.sockets[0].getsockname()[1])
+    speak(w)
+    await frames_until(r, {b"A"})                  # "this takes a while"
+    w.write(wire.frame(b"D"))
+    await frames_until(r, {b"X"})
+    return seen["sessions"][0]
+
+
+def test_a_background_request_asks_and_answers_in_the_dialog_in_progress(tmp_path, monkeypatch, fake_vad):
+    seen = {"chat": [], "tts": [], "stt": 0, "hermes": []}
+
+    async def go():
+        release = asyncio.Event()
+        runner, port = await serve_app(fakes(seen, ["Закажи пиццу.", "Синий."], release=release))
+        s_runner, s_port = await serve_app(surface.app())
+        setup(monkeypatch, port)
+        monkeypatch.setattr(agent, "HERMES_KEY", "hk")
+        monkeypatch.setattr(pipeline, "DETACH_S", 0.3)
+        monkeypatch.setattr(session, "FIRST_IDLE_S", 5)
+        routes = tmp_path / "routes.json"
+        routes.write_text(json.dumps({"default": "pipeline"}))
+        base = f"http://127.0.0.1:{s_port}"
+        async with aiohttp.ClientSession() as http:
+            server = await bridge.serve("127.0.0.1:0", Routes(routes), http)
+            sid = await background_request(http, server, seen)
+            async with http.get(f"{base}/session/{sid}", headers=AUTH) as resp:
+                bg = await resp.json()
+            r, w = await station(server.sockets[0].getsockname()[1])   # the owner is in another dialog now
+            await until(lambda: surface.registry.current() is not None)
+            async with http.post(f"{base}/ask", json={"session": sid, "kind": "text", "text": "Какой цвет коробки?"},
+                                 headers=AUTH) as resp:
+                ask = await resp.json()
+            await frames_until(r, {b"A"})          # the question, with the lead
+            w.write(wire.frame(b"D"))
+            await asyncio.sleep(0.1)
+            speak(w)
+            async with http.get(f"{base}/ask/{ask['id']}?wait=5", headers=AUTH) as resp:
+                answer = await resp.json()
+            await frames_until(r, {b"A"})          # "got it"
+            w.write(wire.frame(b"D"))
+            async with http.post(f"{base}/result", json={"session": sid, "text": "Заказ оформлен, привезут к восьми."},
+                                 headers=AUTH) as resp:
+                result = await resp.json()
+            await frames_until(r, {b"A"})          # the result, told in this dialog
+            w.write(wire.frame(b"D"))
+            got = await frames_until(r, {b"X"})
+            release.set()
+            server.close()
+            await runner.cleanup()
+            await s_runner.cleanup()
+            return bg, ask, answer, result, got
+    bg, ask, answer, result, got = asyncio.run(go())
+    assert bg == {"background": True}
+    assert ask["wake"] is False and answer == {"status": "answered", "answer": "Синий."}
+    assert result == {"announce": False}
+    assert seen["tts"][:4] == [pipeline.DETACHED_SPEECH, surface.FOREIGN_LEAD + "Какой цвет коробки?",
+                               pipeline.ACKS["text"], "Заказ оформлен."]
+    note = seen["chat"][-1]["messages"][-1]["content"]
+    assert "Агент закончил фоновую просьбу «сделай»: Заказ оформлен, привезут к восьми." in note
+    assert got[-1] == (b"X", b"idle")
+
+
+def test_the_owner_hears_of_and_can_stop_a_background_request(tmp_path, monkeypatch, fake_vad):
+    seen = {"chat": [], "tts": [], "stt": 0, "hermes": []}
+
+    def model(body):
+        names = [t["function"]["name"] for t in body["tools"]]
+        if "stop_background" in names and body["messages"][-1].get("role") == "user":
+            return {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "s1", "function": {
+                "name": "stop_background", "arguments": json.dumps({"number": 1})}}]}}]}
+        return None
+
+    async def go():
+        release = asyncio.Event()
+        runner, port = await serve_app(fakes(seen, ["Закажи пиццу.", "Отмени пиццу."], release=release, model=model))
+        s_runner, s_port = await serve_app(surface.app())
+        setup(monkeypatch, port)
+        monkeypatch.setattr(agent, "HERMES_KEY", "hk")
+        monkeypatch.setattr(pipeline, "AGENT_RACE", False)
+        monkeypatch.setattr(pipeline, "DETACH_S", 0.3)
+        routes = tmp_path / "routes.json"
+        routes.write_text(json.dumps({"default": "pipeline"}))
+        async with aiohttp.ClientSession() as http:
+            server = await bridge.serve("127.0.0.1:0", Routes(routes), http)
+            sid = await background_request(http, server, seen)
+            running = [b.session for b in surface.registry.running()]
+            r, w = await station(server.sockets[0].getsockname()[1])
+            speak(w)
+            await frames_until(r, {b"A"})          # after stop_background
+            w.write(wire.frame(b"D"))
+            got = await frames_until(r, {b"X"})
+            release.set()
+            server.close()
+            await runner.cleanup()
+            await s_runner.cleanup()
+            return sid, running, got
+    sid, running, got = asyncio.run(go())
+    assert running == [sid]
+    stop_round = seen["chat"][-2]
+    assert "1. «сделай», идёт" in stop_round["messages"][0]["content"]
+    assert "stop_background" in [t["function"]["name"] for t in stop_round["tools"]]
+    assert seen["chat"][-1]["messages"][-1]["content"].startswith("Остановлено: «сделай»")
+    assert surface.registry.running() == [] and sid in surface.registry.abandoned
+    assert seen["tts"][-1] == "Готово." and got[-1] == (b"X", b"idle")
 
 
 def test_with_no_dialog_the_speakers_are_woken_and_the_loudest_answers(tmp_path, monkeypatch, fake_vad):

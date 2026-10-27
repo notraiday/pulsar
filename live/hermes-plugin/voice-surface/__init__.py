@@ -10,6 +10,7 @@ def register(ctx: Any) -> None:
     core.install()
     vaultwarden.install()
     ctx.register_hook("post_llm_call", core.post_llm_call)
+    ctx.register_middleware("llm_request", core.llm_request)
     ctx.register_tool(
         name="ask_owner",
         toolset="voice_surface",

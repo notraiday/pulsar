@@ -19,7 +19,7 @@ from .util import wav16k
 
 log = logging.getLogger("live")
 
-URL = os.environ.get("LIVE_STT_URL", "").rstrip("/")      # e.g. http://192.168.1.125:8008/v1
+URL = os.environ.get("LIVE_STT_URL", "").rstrip("/")      # e.g. http://192.168.1.50:8008/v1
 KEY = os.environ.get("LIVE_STT_KEY", "")
 MODEL = os.environ.get("LIVE_STT_MODEL", "v3_e2e_rnnt")
 LANGUAGE = os.environ.get("LIVE_STT_LANGUAGE", "ru")

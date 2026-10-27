@@ -124,6 +124,13 @@ TEXT_NOTE = (
     "бессмысленна (обрывок слова, случайный набор слов) или это явно чужой разговор или телевизор; любая обычная "
     "реплика, просьба или подкол — это тебе, отвечай.")
 
+# Added to the persona while agent requests run in the background (this dialog's or earlier ones').
+BACKGROUND_NOTE = (
+    "\n\nСейчас агент в фоне выполняет просьбы хозяина:\n{tasks}\n"
+    "Спросит хозяин, как дела с такой просьбой, — отвечай по этому списку сама: новый запрос агенту о ней "
+    "ничего не знает, и такую просьбу ему не повторяй. Агенту нужен ответ хозяина — он спросит сам. Хозяин "
+    "просит отменить или остановить такую просьбу — вызови stop_background с её номером.")
+
 SENT_RE = re.compile(r"(.+?[.!?…]+[\"»)]?)(?:\s+|$)", re.S)
 
 TOOLS = [
@@ -150,6 +157,12 @@ TOOLS = [
                        "at once; there is no next turn.",
         "parameters": {"type": "object", "properties": {}}}},
 ]
+# Offered only while requests run in the background.
+STOP_TOOL = {"type": "function", "function": {
+    "name": "stop_background",
+    "description": "Stop a request the agent is doing in the background (numbered in the instructions), when the "
+                   "owner asks to cancel or stop it. The agent's run is interrupted; what it already did stays done.",
+    "parameters": {"type": "object", "properties": {"number": {"type": "integer"}}, "required": ["number"]}}}
 
 
 def tts_body(text: str, voice: str = "") -> dict:
@@ -190,6 +203,7 @@ class Dialog(Session):
         self.carry = False     # the next answer has to cover results the owner has not heard yet
         self.asked = {}        # call id -> the agent request, for notes about results the owner has not heard
         self.questions = []    # surface.Ask the agent asked the owner, the first one is being asked
+        self.in_tools = False  # the reply waits for its tool calls (the agent may be asking the owner meanwhile)
         self.woken = False     # the house opened this dialog to ask the owner something (surface.py)
 
     async def open(self):
@@ -205,6 +219,7 @@ class Dialog(Session):
                  " via " + ",".join(self.provider.get("order") or ["any"]) + (" zdr" if self.provider.get("zdr") else "")
                  if self.provider else "", TTS, self.voice, self.agent.describe())
         self._warm = asyncio.create_task(self.prewarm())
+        surface.registry.opened(self)
         if stt.needs_text() and stt.mode() == "text":
             self.instructions += TEXT_NOTE
         reminder = clean_for_speech(str(self.st.hello.get("reminder") or ""))
@@ -237,7 +252,7 @@ class Dialog(Session):
         return any(not t.done() for t in self.tools.values())
 
     def followup_due(self) -> bool:
-        return self.has_unspoken_results()
+        return self.has_unspoken_results() and not self.questions  # not over the agent's question
 
     def on_utterance(self, pcm: bytes, text: str | None = None, pending=None):
         if self.group is not None and not self.group.won(self):
@@ -252,6 +267,7 @@ class Dialog(Session):
     async def close(self):
         """The dialog is over: agent requests it was waiting for stop (closing the request interrupts the agent);
         detached ones go on. A question nobody else can take any more gets no answer."""
+        surface.registry.closed(self)
         for t in self.tools.values():
             if not t.done():
                 t.cancel()
@@ -267,10 +283,12 @@ class Dialog(Session):
     def secret_turn(self) -> bool:
         return bool(self.questions) and self.questions[0].asked and self.questions[0].secret
 
-    def take_ask(self, a) -> bool:
-        """Called by the registry: ask `a` in this dialog (after the questions already waiting)."""
+    def take_ask(self, a, lead: str = "") -> bool:
+        """Called by the registry: ask `a` in this dialog (after the questions already waiting). `lead`: said
+        before it (a background request's question in a dialog that did not start it)."""
         if self.ending or self.st.closing:
             return False
+        a.lead = lead
         a.holders.add(self)
         self.questions.append(a)
         if len(self.questions) == 1:
@@ -278,13 +296,13 @@ class Dialog(Session):
         return True
 
     async def pose(self, a, prefix: str = ""):
-        for _ in range(40):  # let what is playing finish (at most ~10 s)
-            if not self.speaking:
+        for _ in range(60):  # let what is playing, or a reply being written, finish (at most ~15 s)
+            if not self.speaking and not (self.turn_open and not self.in_tools):
                 break
             await asyncio.sleep(0.25)
         a.asked = True
         self.touch()
-        await self.say(prefix + a.text)
+        await self.say(prefix + a.lead + a.text)
         if not self.turn_open:
             self.set_state("listening")
 
@@ -325,6 +343,29 @@ class Dialog(Session):
     def next_question(self):
         if self.questions:
             self.questions.pop(0).holders.discard(self)
+
+    def asking_for(self, session: str) -> bool:
+        return bool(session) and any(a.session == session and not a.future.done() for a in self.questions)
+
+    # ---- requests running in the background (surface.py) ----
+    def background_result(self, request: str, text: str):
+        """A background request another dialog started has finished while the owner is in this one."""
+        self.notes.append(f"(Агент закончил фоновую просьбу «{request}»: {text or 'готово.'} Расскажи хозяину.)")
+
+    def background_note(self, running) -> str:
+        if not running:
+            return ""
+        now = time.monotonic()
+        return BACKGROUND_NOTE.format(tasks="\n".join(f"{i}. {b.describe(now)}" for i, b in enumerate(running, 1)))
+
+    def stop_background(self, args: dict) -> str:
+        running = surface.registry.running()
+        try:
+            b = running[int(args.get("number") or 0) - 1]
+        except (ValueError, TypeError, IndexError):
+            return "Нет фоновой задачи с таким номером." if running else "Фоновых задач нет."
+        surface.registry.stop(b.session)
+        return f"Остановлено: «{b.request[:120]}». Агент прерван; что он успел сделать до этого, отменено не было."
 
     # ---- reply ----
     # ---- tool calls that survive an interruption ----
@@ -501,7 +542,11 @@ class Dialog(Session):
                     t.add_done_callback(lambda t, c=c: self.tool_done(c, t))
                     tasks.append(t)
                 # shield: a barge-in cancels this turn (speech, model stream) but not the tools themselves
-                results = await asyncio.gather(*[asyncio.shield(t) for t in tasks])
+                self.in_tools = True
+                try:
+                    results = await asyncio.gather(*[asyncio.shield(t) for t in tasks])
+                finally:
+                    self.in_tools = False
                 for c, r in zip(calls, results):
                     self.history.append({"role": "tool", "tool_call_id": c["id"], "content": r})
                     self.tools.pop(c["id"], None)
@@ -644,8 +689,10 @@ class Dialog(Session):
 
     async def llm_round(self, q: asyncio.Queue):
         self.prepare_history()
-        body = {"model": self.llm, "stream": True, "tools": TOOLS,
-                "messages": [{"role": "system", "content": self.instructions}] + self.history}  # provider pinning: llm_events
+        running = surface.registry.running()
+        body = {"model": self.llm, "stream": True, "tools": TOOLS + ([STOP_TOOL] if running else []),
+                "messages": [{"role": "system", "content": self.instructions + self.background_note(running)}]
+                + self.history}  # provider pinning: llm_events
         reasoning = reasoning_for(self.llm)
         if reasoning:
             body["reasoning"] = reasoning
@@ -795,6 +842,8 @@ class Dialog(Session):
             else:
                 task = asyncio.create_task(self.ask_agent(request))
             return await self.wait_or_detach(task, request)
+        if c["name"] == "stop_background":
+            return self.stop_background(args)
         return f"unknown tool {c['name']}"
 
     async def wait_or_detach(self, task: asyncio.Task, request: str) -> str:
@@ -805,6 +854,8 @@ class Dialog(Session):
             if DETACH_S <= 0:
                 return await asyncio.shield(task)
             done, _ = await asyncio.wait({task}, timeout=DETACH_S)
+            while task not in done and self.asking_for(_session_of.get(task, "")):
+                done, _ = await asyncio.wait({task}, timeout=0.5)  # the owner is answering its question here
             if task in done:
                 return task.result()
         except asyncio.CancelledError:
@@ -813,7 +864,7 @@ class Dialog(Session):
         self.bg.discard(task)
         _background.add(task)
         sid = _session_of.get(task, "")
-        surface.registry.detach(sid)
+        surface.registry.detach(sid, task, request)
         log.info("agent request still running after %.0fs, it goes on in the background (session %s)", DETACH_S,
                  sid or "?")
 
@@ -833,12 +884,15 @@ class Dialog(Session):
 
         def bound(sid: str):
             _session_of[task] = sid
-            surface.registry.bind(sid, self)
+            surface.registry.bind(sid, self, request)
+
+        def step(label: str):
+            surface.registry.progress(_session_of.get(task, ""), label)
         sid = f"live-{secrets.token_hex(8)}" if self.agent.names_sessions() else ""
         if sid:
             bound(sid)
         try:
-            return await self.agent.ask(request, on_session=bound, session=sid)
+            return await self.agent.ask(request, on_session=bound, session=sid, on_progress=step)
         except asyncio.CancelledError:
             surface.registry.abandon(_session_of.get(task, ""), self)
             raise

@@ -8,7 +8,10 @@ can answer. In this profile's api_server sessions the Live bridge can, so:
   * a card fill is confirmed by voice, naming the card and the site;
   * the ``ask_owner`` tool lets the agent ask a yes / no or a short question (before it orders or pays);
   * after every turn the bridge is told the answer is ready (/result); when the Live dialog that asked has ended
-    (the request went on in the background) the answer is announced through Home Assistant (``wake_script``).
+    (the request went on in the background) and no other one is in progress, the answer is announced through Home
+    Assistant (``wake_script``);
+  * a request that went on in the background thinks: its model calls carry ``hermes_live_background``, which the
+    model router in front of the agent turns into its thinking model (litellm-taint, ``cloud-think``).
 
 When there is no live dialog for the session, the bridge says "wake" and the speakers are woken the same way, with
 the question as the text; the dialog that opens takes the answer.
@@ -29,6 +32,7 @@ from typing import Any, Optional
 log = logging.getLogger("voice_surface")
 
 PLUGIN_ID = "voice-surface"
+BACKGROUND_FIELD = "hermes_live_background"  # read (and removed) by the model router
 _TAG_RE = re.compile(r"\[(?:emo:[a-z]+|SILENT)\]", re.I)
 _installed = False
 
@@ -44,7 +48,7 @@ def settings() -> dict:
         cfg = {}
     entry = ((cfg.get("plugins") or {}).get("entries") or {}).get(PLUGIN_ID) or {}
     raw = entry.get("settings") if isinstance(entry, dict) else None
-    out = {"bridge_url": "http://192.168.1.125:10702", "profile": "voice", "wake_script": "script.live_reminder"}
+    out = {"bridge_url": "http://192.168.1.50:10702", "profile": "voice", "wake_script": "script.live_reminder"}
     if isinstance(raw, dict):
         out.update({k: v for k, v in raw.items() if v})
     return out
@@ -237,6 +241,34 @@ def post_llm_call(session_id: str = "", assistant_response: Any = "", platform: 
     return None
 
 
+# ---- requests that went on in the background think -------------------------------------------------------------
+
+_background: set = set()  # sessions the bridge reported in the background (they never come back)
+
+
+def llm_request(request: Any = None, session_id: str = "", platform: str = "", **_: Any):
+    """``llm_request`` middleware: once the bridge says a Live request went on in the background (nobody is
+    waiting for it), every later model call of it asks the router for the thinking model."""
+    try:
+        if platform != "api_server" or not str(session_id).startswith("live-") or not isinstance(request, dict):
+            return None
+        if session_id not in _background:
+            if _home().name != settings()["profile"] or not _token():
+                return None
+            if not _bridge("GET", f"/session/{session_id}", timeout=0.5).get("background"):
+                return None
+            if len(_background) > 1000:
+                _background.clear()
+            _background.add(session_id)
+            log.info("voice-surface: %s went on in the background: its model calls think from now on", session_id)
+        req = dict(request)
+        req["extra_body"] = dict(req.get("extra_body") or {}, **{BACKGROUND_FIELD: True})
+        return {"request": req, "source": PLUGIN_ID, "reason": "background Live request: thinking model"}
+    except Exception as e:  # never break the call
+        log.debug("voice-surface: llm_request: %r", e)
+        return None
+
+
 # ---- the ask_owner tool ----------------------------------------------------------------------------------------
 
 ASK_OWNER_DESCRIPTION = (
@@ -244,7 +276,9 @@ ASK_OWNER_DESCRIPTION = (
     "minutes). Use kind=confirm before anything that orders, books or pays: say what exactly and the total "
     "(\"Две пиццы, тысяча двести девяносто рублей, доставка к восьми. Заказываю?\") and go on only on yes. "
     "kind=text for a short choice you cannot make yourself (which item, which address). Do not use it for one-time "
-    "codes: the vault code tool asks for those without you seeing them. Russian, one or two short sentences.")
+    "codes: the vault code tool asks for those without you seeing them. Russian, one or two short sentences, "
+    "understandable on their own: the owner may be busy with another conversation by then, so name what it is "
+    "about (\"Пицца: на какой адрес везти?\").")
 ASK_OWNER_PARAMETERS = {
     "type": "object",
     "properties": {

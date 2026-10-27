@@ -6,12 +6,13 @@ description: >-
   were refused. This routes them to the Live bridge (pulsar live/bridge, surface.py), which asks the owner through
   the speakers and returns only the parsed answer (a code is typed into the page by Hermes and never reaches the
   model). Also: the ask_owner tool, the Bitwarden session from hermes-bw-unlock (RAM only), Bitwarden cards and
-  identities as payment / address vault items, and announcing answers of requests whose Live dialog has ended.
+  identities as payment / address vault items, announcing answers of requests whose Live dialog has ended, and
+  (llm_request middleware) the router's thinking model for requests that went on in the background.
 author: local
 config_schema:
   bridge_url:
     type: str
-    default: "http://192.168.1.125:10702"
+    default: "http://192.168.1.50:10702"
     description: The Live bridge's owner surface (LIVE_SURFACE_LISTEN)
   profile:
     type: str
