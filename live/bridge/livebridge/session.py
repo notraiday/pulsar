@@ -68,6 +68,8 @@ class Session:
         self.http = None                # backends that have one set it (stt.py uses it)
         self.spec = None                # transcript of the utterance so far, started at its first pause (stt.py)
         self.rest = None                # task deciding, from that transcript, when the pause ends the utterance
+        self.overlap = False            # the owner talks while the answer is being made: it waits (on_utterance decides)
+        self.utt_started = 0.0          # when the current / last utterance started (monotonic)
         self.bg: set = set()            # background tasks of the dialog (cancelled when it ends)
         self.play_end = 0.0             # when the audio sent so far will have played (monotonic; 0 = nothing queued)
 
@@ -122,6 +124,7 @@ class Session:
         """Another station of this reminder's group answers the owner: this dialog ends now."""
         self.vad_off = True
         self.utt, self.pre, self.flags = None, [], []
+        self.overlap = False
         self.ending = reason
         self.cancel_response(flush=True)
 
@@ -240,16 +243,16 @@ class Session:
                 return
             busy = self.speaking or self.turn_open
             answering = self.awaiting_answer()
-            need = (BARGE_MS if self.speaking or (busy and not answering) else START_MS) // FRAME_MS
+            # over our own voice it takes BARGE_MS to tell the owner from the echo; while the answer is only being
+            # made nothing plays, and the owner is heard at once (the answer waits, see `overlap`)
+            need = (BARGE_MS if self.speaking else START_MS) // FRAME_MS
             recent = self.flags[-need:]
             if len(recent) == need and sum(recent) >= math.ceil(need * VOICED_RATIO):
-                if busy and not answering:
-                    log.info("barge-in by voice (%s, p %.2f, %.0f dBFS)", "speaking" if self.speaking else "thinking",
-                             sum(self.probs[-need:]) / need, sum(self.dbs[-need:]) / need)
-                    self.dump("barge-" + ("speaking" if self.speaking else "thinking"), b"".join(self.ring),
-                              self.probs, self.dbs)
-                    self.echo = [0, 0.0, 0.0, 0]    # the last frames were the owner, not echo
-                    self.cancel_response(flush=True)
+                if self.speaking and not answering:
+                    self.barge_in(need)
+                elif busy and not answering:
+                    log.info("the owner talks while the answer is being made: it waits")
+                    self.overlap = True
                 elif answering and self.speaking:
                     log.info("the owner answers over the question")
                     self.echo = [0, 0.0, 0.0, 0]
@@ -257,6 +260,7 @@ class Session:
                     self.play_end = 0.0
                     self.speaking = False
                 self.utt = self.pre[-(need + LEAD_FRAMES):]
+                self.utt_started = time.monotonic() - need * FRAME_MS / 1000
                 self.voiced_in_utt = sum(recent)
                 if self.group is not None:
                     self.group.claim(self, [d for d, v in zip(self.dbs[-need:], recent) if v])
@@ -270,6 +274,10 @@ class Session:
             self.voiced_in_utt += 1
             self.silence = 0
             self.touch()
+            if self.overlap and self.voiced_in_utt * FRAME_MS >= BARGE_MS:
+                self.overlap = False  # long enough to be the owner going on: the answer begun is cut now
+                if self.turn_open:
+                    self.barge_in(BARGE_MS // FRAME_MS)
             if self.group is not None:
                 self.group.heard(self, db)
             if self.spec is not None:
@@ -289,6 +297,13 @@ class Session:
             else:  # the transcript made ahead decides how long the pause has to be
                 self.rest = self.spawn(self.wait_rest(self.utt, self.spec))
 
+    def barge_in(self, need: int):
+        log.info("barge-in by voice (%s, p %.2f, %.0f dBFS)", "speaking" if self.speaking else "thinking",
+                 sum(self.probs[-need:]) / need, sum(self.dbs[-need:]) / need)
+        self.dump("barge-" + ("speaking" if self.speaking else "thinking"), b"".join(self.ring), self.probs, self.dbs)
+        self.echo = [0, 0.0, 0.0, 0]    # the last frames were the owner, not echo
+        self.cancel_response(flush=True)
+
     def end_utterance(self):
         utt, voiced_n = self.utt, self.voiced_in_utt
         self.utt, self.pre, self.flags = None, [], []
@@ -303,11 +318,19 @@ class Session:
                 spec.cancel()
             log.info("ignored a short noise (%d ms voiced)", voiced_n * FRAME_MS)
             self.dump("noise", pcm)
+            self.release()
             self.on_noise()
             return
         log.info("utterance %.1fs (%d ms voiced)", len(pcm) / 32000, voiced_n * FRAME_MS)
         self.dump("utt", pcm)
         self.on_utterance(pcm, None, spec)
+
+    def release(self):
+        """What made the answer wait was not the owner talking: it goes on."""
+        if self.overlap:
+            self.overlap = False
+            if self.turn_open and not self.speaking:
+                self.set_state("thinking")
 
     def forget_rest(self):
         if self.rest is not None and self.rest is not asyncio.current_task():
@@ -344,6 +367,7 @@ class Session:
             log.info("ignored a short noise (%d ms voiced)%s", voiced_ms,
                      f", heard {text!r}" if text and not self.secret_turn() else "")
             self.dump("noise", pcm)
+            self.release()
             if not self.vad_off and not self.ending:
                 self.on_noise()
 

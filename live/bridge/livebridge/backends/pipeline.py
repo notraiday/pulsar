@@ -324,7 +324,25 @@ class Dialog(Session):
         if self.awaiting_answer():
             self.spawn(self.answer(self.questions[0], pcm, text, pending))
             return
+        if self.overlap:
+            self.spawn(self.continuation(pcm, text, pending))
+            return
         self.start_response(pcm, text, pending)
+
+    async def continuation(self, pcm: bytes, text: str | None, pending):
+        """The owner said a little more while the answer was being made (too little to cut it at once; the answer has
+        been waiting): with words it is their turn going on, without them it was noise and the answer goes on."""
+        if text is None and stt.needs_text():
+            text = await pending if pending is not None else await stt.transcribe(self.http, pcm)
+        if stt.needs_text() and text is not None and not stt.has_words(text):
+            log.info("no words in what the owner said over the answer being made: it goes on")
+            self.release()
+            return
+        self.overlap = False
+        if self.turn_open and self.resp is not None and not self.resp.done():
+            log.info("the owner went on while the answer was being made")
+            self.cancel_response(flush=True)
+        self.start_response(pcm, text)
 
     async def close(self):
         """The dialog is over: agent requests it was waiting for stop (closing the request interrupts the agent);
@@ -512,7 +530,8 @@ class Dialog(Session):
             # an agent request that has already finished did something: it stays, and so does the turn as it was
             done = any(self.tools.get(tc["id"]) is None or self.tools[tc["id"]].done()
                        for m in self.reply for tc in m.get("tool_calls") or [])
-            merge = time.monotonic() - self.turn_end <= MERGE_S and not done
+            went_on = self.utt_started if self.utt_started > self.turn_end else time.monotonic()
+            merge = went_on - self.turn_end <= MERGE_S and not done
             self.cut = {"user": self.reply_user, "merge": merge}
             if merge:
                 self.drop_reply()
@@ -989,6 +1008,8 @@ class Dialog(Session):
             seg = {"msg": msg, "text": s, "start": None, "end": None}
             self.segs.append(seg)
             async for pcm in self.tts_chunks(s):
+                while self.overlap and not self.speaking:  # the owner is talking: do not start over them
+                    await asyncio.sleep(0.03)
                 start, seg["end"] = self.queued(len(pcm))
                 if seg["start"] is None:
                     seg["start"] = start

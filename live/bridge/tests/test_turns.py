@@ -48,6 +48,7 @@ def run(tmp_path, monkeypatch, transcripts, script, reply=lambda body: "Хоро
     seen = {"chat": [], "tts": [], "stt": 0}
     monkeypatch.setattr(pipeline, "OR_KEY", "test-key")
     monkeypatch.setattr(pipeline, "AGENT_RACE", False)
+    monkeypatch.setattr(pipeline, "LLM_HEDGE_S", 0)   # the slow first round is on purpose
     monkeypatch.setattr(agent, "AGENT", "hermes")
     monkeypatch.setattr(session, "IDLE_S", 0.6)
     monkeypatch.setattr(stt, "INPUT", "text")
@@ -153,3 +154,17 @@ def test_a_turn_the_model_left_unanswered_takes_the_next_utterance(tmp_path, mon
                [(LOUDER, 12), (QUIET, 31), (LOUDER, 10), (QUIET, 25)], reply=reply)
     assert users(seen["chat"][-1]) == ["Сколько будет два. Плюс три."]
     assert seen["tts"] == ["Пять."]
+
+
+def test_a_short_addition_while_the_answer_is_made_goes_on_the_turn(tmp_path, monkeypatch, fake_vad):
+    # "три" is too short to cut an answer that plays, but nothing plays yet: the answer waits and the turn grows
+    seen = run(tmp_path, monkeypatch, ["Сколько будет два.", "Три."],
+               [(LOUDER, 12), (QUIET, 30), (LOUDER, 8), (QUIET, 25)], think_s=2.0)
+    assert users(seen["chat"][-1]) == ["Сколько будет два. Три."]
+    assert seen["tts"] == ["Хорошо."]
+
+
+def test_short_noise_while_the_answer_is_made_leaves_it_alone(tmp_path, monkeypatch, fake_vad):
+    seen = run(tmp_path, monkeypatch, ["Сколько будет два плюс два?", ""],
+               [(LOUDER, 12), (QUIET, 30), (LOUDER, 8), (QUIET, 25)], think_s=2.0)
+    assert len(seen["chat"]) == 1 and seen["tts"] == ["Хорошо."]
