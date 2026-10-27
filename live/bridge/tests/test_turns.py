@@ -213,3 +213,23 @@ def test_a_resume_is_not_picked_back_up_again_after_more_noise(tmp_path, monkeyp
                reply=reply, tts_s=1.0)
     assert len(seen["chat"]) == 1        # never re-answered
     assert len(resumes) == 1             # picked back up exactly once — the loop would call it again and again
+
+
+def test_a_voiced_burst_with_no_words_does_not_cut_the_answer(tmp_path, monkeypatch, fake_vad):
+    # over the answer, a sound just above the cancelled floor that transcribes to nothing (room noise / AEC leak)
+    # must NOT cut it: LOUD frames (non-voiced here) raise the echo floor, then a LOUDER burst only ~6 dB over it is
+    # below the instant-cut margin, so the answer keeps playing and the empty transcript confirms it was not words.
+    from conftest import LOUD
+    answer = "Один раз. Два раза. Три раза. Четыре раза. Пять раз."
+
+    def reply(body):
+        return answer if len(users(body)) == 1 else "Не должно быть."
+    barges = []
+    orig = pipeline.Dialog.barge_in
+    monkeypatch.setattr(pipeline.Dialog, "barge_in", lambda self, need: barges.append(1) or orig(self, need))
+    seen = run(tmp_path, monkeypatch, ["Расскажи что-нибудь.", ""],
+               [(LOUDER, 12), (QUIET, 28), (LOUD, 22), (LOUDER, 16), (QUIET, 80)], reply=reply, tts_s=1.0)
+    assert len(seen["chat"]) == 1                      # no re-answer: the burst did not become a turn
+    # the only barge is the initial LOUDER that opens the turn; the later over-the-answer burst must NOT cut it
+    assert len(barges) == 0, f"the wordless burst cut the answer ({len(barges)} barge-ins)"
+    assert "Пять раз." in seen["tts"]                  # the answer played to the end, uncut

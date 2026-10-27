@@ -345,8 +345,9 @@ class Dialog(Session):
             self.release()
             return
         self.overlap = False
-        if self.turn_open and self.resp is not None and not self.resp.done():
-            log.info("the owner went on while the answer was being made")
+        if self.turn_open and (self.speaking or (self.resp is not None and not self.resp.done())):
+            log.info("the owner said something with words over the answer %s: cutting it",
+                     "playing" if self.speaking else "being made")
             self.cancel_response(flush=True)
         self.start_response(pcm, text)
 

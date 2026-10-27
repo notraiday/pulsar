@@ -32,11 +32,12 @@ END_SILENCE_MS = int(os.environ.get("LIVE_END_SILENCE_MS", "600"))
 END_SILENCE_LONG_MS = int(os.environ.get("LIVE_END_SILENCE_LONG_MS", "1400"))
 START_MS = int(os.environ.get("LIVE_START_MS", "192"))
 BARGE_MS = int(os.environ.get("LIVE_BARGE_MS", "480"))   # speech needed to cut an answer that is playing or being made
-# A barge-in while the answer plays must be this many dB above the cancelled/ambient floor (the level the station's
-# echo canceller leaves between sounds, measured from the non-voiced frames). Room noise and AEC leak on transients
-# sit ~5-15 dB over that floor; the owner addressing the speaker is ~20 dB over it. Lower it if real interruptions are
-# missed, raise it if noise/echo still cuts the answer.
-BARGE_FLOOR_MARGIN_DB = float(os.environ.get("LIVE_BARGE_FLOOR_MARGIN_DB", "14"))
+# A sound this many dB above the cancelled/ambient floor (the level the station's echo canceller leaves between
+# sounds, measured from the non-voiced frames) cuts the answer at once. Below it, the answer keeps playing and is cut
+# only if what was said turns out to have words (so room noise / AEC leak, which transcribes to nothing, never cuts).
+# Room noise and AEC leak sit ~5-15 dB over the floor; the owner addressing the speaker is ~20 dB over it. Lower it
+# for a snappier cut on quieter speech, raise it if noise/leak still cuts the answer before the words check catches it.
+BARGE_FLOOR_MARGIN_DB = float(os.environ.get("LIVE_BARGE_FLOOR_MARGIN_DB", "18"))
 EFLOOR_ALPHA = 0.1  # EWMA weight for the floor estimate (~320 ms)
 MIN_SPEECH_MS = int(os.environ.get("LIVE_MIN_SPEECH_MS", "320"))
 MAX_UTT_S = float(os.environ.get("LIVE_MAX_UTT_S", "25"))
@@ -262,10 +263,14 @@ class Session:
             if len(recent) == need and sum(recent) >= math.ceil(need * VOICED_RATIO):
                 if self.speaking and not answering:
                     cand = sum(self.dbs[-need:]) / need
-                    if self.echo_floor is not None and self.echo_floor_n >= need \
-                            and cand < self.echo_floor + BARGE_FLOOR_MARGIN_DB:
-                        return  # within the cancelled floor + margin: room noise or AEC leak, not the owner
-                    self.barge_in(need)
+                    loud = (self.echo_floor is None or self.echo_floor_n < need
+                            or cand >= self.echo_floor + BARGE_FLOOR_MARGIN_DB)
+                    if loud:
+                        self.barge_in(need)   # clearly above the cancelled floor: cut the answer now
+                    else:
+                        # maybe the owner, maybe room noise / AEC leak above the floor: keep playing and let the
+                        # transcript decide — the answer is cut only if what was said has words (continuation)
+                        self.overlap = True
                 elif busy and not answering:
                     log.info("the owner talks while the answer is being made: it waits")
                     self.overlap = True
@@ -290,8 +295,8 @@ class Session:
             self.voiced_in_utt += 1
             self.silence = 0
             self.touch()
-            if self.overlap and self.voiced_in_utt * FRAME_MS >= BARGE_MS:
-                self.overlap = False  # long enough to be the owner going on: the answer begun is cut now
+            if self.overlap and not self.speaking and self.voiced_in_utt * FRAME_MS >= BARGE_MS:
+                self.overlap = False  # long enough to be the owner going on: the answer being made is cut now
                 if self.turn_open:
                     self.barge_in(BARGE_MS // FRAME_MS)
             if self.group is not None:
