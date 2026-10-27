@@ -10,8 +10,11 @@ can answer. In this profile's api_server sessions the Live bridge can, so:
   * after every turn the bridge is told the answer is ready (/result); when the Live dialog that asked has ended
     (the request went on in the background) and no other one is in progress, the answer is announced through Home
     Assistant (``wake_script``);
-  * a request that went on in the background thinks: its model calls carry ``hermes_live_background``, which the
-    model router in front of the agent turns into its thinking model (litellm-taint, ``cloud-think``).
+  * website tasks and requests that went on in the background think: their model calls carry
+    ``hermes_live_think``, which the model router in front of the agent turns into its thinking model
+    (litellm-taint, ``cloud-think``) - except the step right after a browser action that worked (a click, typing:
+    what comes next is mechanical, usually a look at the page), which stays on the fast model ("system 1"), at most
+    SYSTEM1_MAX times in a row.
 
 When there is no live dialog for the session, the bridge says "wake" and the speakers are woken the same way, with
 the question as the text; the dialog that opens takes the answer.
@@ -32,7 +35,11 @@ from typing import Any, Optional
 log = logging.getLogger("voice_surface")
 
 PLUGIN_ID = "voice-surface"
-BACKGROUND_FIELD = "hermes_live_background"  # read (and removed) by the model router
+THINK_FIELD = "hermes_live_think"  # read (and removed) by the model router
+# Browser tools that act on a page and return no page: the step after one that worked is mechanical.
+ACTIONS = frozenset({"browser_click", "browser_type", "browser_press", "browser_scroll", "browser_back",
+                     "browser_vault_fill", "browser_vault_enter_code", "browser_dialog"})
+SYSTEM1_MAX = 3
 _TAG_RE = re.compile(r"\[(?:emo:[a-z]+|SILENT)\]", re.I)
 _installed = False
 
@@ -241,29 +248,68 @@ def post_llm_call(session_id: str = "", assistant_response: Any = "", platform: 
     return None
 
 
-# ---- requests that went on in the background think -------------------------------------------------------------
+# ---- website tasks and requests that went on in the background think ----------------------------------------
 
-_background: set = set()  # sessions the bridge reported in the background (they never come back)
+_think: set = set()        # sessions whose model calls think (they never go back)
+_streak: dict = {}         # session -> fast ("system 1") calls in a row
+
+
+def _browser_used(messages) -> bool:
+    return any(str((tc.get("function") or {}).get("name") or "").startswith("browser_")
+               for m in messages if isinstance(m, dict) and m.get("role") == "assistant"
+               for tc in m.get("tool_calls") or [] if isinstance(tc, dict))
+
+
+def _routine(messages) -> bool:
+    """The last tool results answer only browser actions, all of which worked."""
+    i, results = len(messages) - 1, []
+    while i >= 0 and isinstance(messages[i], dict) and messages[i].get("role") == "tool":
+        results.append(messages[i])
+        i -= 1
+    if not results or i < 0 or messages[i].get("role") != "assistant":
+        return False
+    names = {tc.get("id"): (tc.get("function") or {}).get("name") for tc in messages[i].get("tool_calls") or []
+             if isinstance(tc, dict)}
+    for r in results:
+        if names.get(r.get("tool_call_id")) not in ACTIONS:
+            return False
+        c = r.get("content")
+        text = (c if isinstance(c, str) else json.dumps(c, ensure_ascii=False)).replace(" ", "")
+        if '"success":false' in text or '"success":true' not in text:
+            return False
+    return True
 
 
 def llm_request(request: Any = None, session_id: str = "", platform: str = "", **_: Any):
-    """``llm_request`` middleware: once the bridge says a Live request went on in the background (nobody is
-    waiting for it), every later model call of it asks the router for the thinking model."""
+    """``llm_request`` middleware for the Live bridge's sessions: website tasks (the dialog model said so, or the
+    agent has used the browser) and requests that went on in the background (nobody waits) ask the router for the
+    thinking model, but for the mechanical step after a browser action."""
     try:
         if platform != "api_server" or not str(session_id).startswith("live-") or not isinstance(request, dict):
             return None
-        if session_id not in _background:
+        messages = request.get("messages") or []
+        if session_id not in _think:
             if _home().name != settings()["profile"] or not _token():
                 return None
-            if not _bridge("GET", f"/session/{session_id}", timeout=0.5).get("background"):
+            if _browser_used(messages):
+                why = "the agent uses the browser"
+            else:
+                st = _bridge("GET", f"/session/{session_id}", timeout=0.5)
+                why = "a website task" if st.get("think") else "in the background" if st.get("background") else ""
+            if not why:
                 return None
-            if len(_background) > 1000:
-                _background.clear()
-            _background.add(session_id)
-            log.info("voice-surface: %s went on in the background: its model calls think from now on", session_id)
+            if len(_think) > 1000:
+                _think.clear()
+                _streak.clear()
+            _think.add(session_id)
+            log.info("voice-surface: %s thinks from now on (%s)", session_id, why)
+        if _routine(messages) and _streak.get(session_id, 0) < SYSTEM1_MAX:
+            _streak[session_id] = _streak.get(session_id, 0) + 1
+            return None
+        _streak[session_id] = 0
         req = dict(request)
-        req["extra_body"] = dict(req.get("extra_body") or {}, **{BACKGROUND_FIELD: True})
-        return {"request": req, "source": PLUGIN_ID, "reason": "background Live request: thinking model"}
+        req["extra_body"] = dict(req.get("extra_body") or {}, **{THINK_FIELD: True})
+        return {"request": req, "source": PLUGIN_ID, "reason": "Live request that thinks"}
     except Exception as e:  # never break the call
         log.debug("voice-surface: llm_request: %r", e)
         return None

@@ -70,6 +70,9 @@ DETACH_S = float(os.environ.get("LIVE_AGENT_DETACH_S", "20"))  # an agent reques
 DETACHED_NOTE = ("Агент продолжает эту задачу в фоне. Если ему понадобится код или подтверждение, он сам спросит хозяина "
                  "через колонку, а результат скажет, когда закончит.")
 DETACHED_SPEECH = "Это надолго — занимаюсь, позову, если что-то понадобится."
+STEERED_NOTE = ("Передано агенту в идущую задачу: он учтёт это после текущего шага. Итог этой задачи придёт, когда "
+                "закончит.")
+STEERED_SPEECH = "Передала, учтёт по ходу."
 ACKS = {"code": "Принято, ввожу.", "yes": "Хорошо.", "no": "Поняла, не делаю.", "text": "Поняла."}
 _background: set = set()  # detached agent requests: they outlive their dialog
 _session_of: "weakref.WeakKeyDictionary[asyncio.Task, str]" = weakref.WeakKeyDictionary()  # agent request -> agent session
@@ -124,12 +127,14 @@ TEXT_NOTE = (
     "бессмысленна (обрывок слова, случайный набор слов) или это явно чужой разговор или телевизор; любая обычная "
     "реплика, просьба или подкол — это тебе, отвечай.")
 
-# Added to the persona while agent requests run in the background (this dialog's or earlier ones').
-BACKGROUND_NOTE = (
-    "\n\nСейчас агент в фоне выполняет просьбы хозяина:\n{tasks}\n"
-    "Спросит хозяин, как дела с такой просьбой, — отвечай по этому списку сама: новый запрос агенту о ней "
-    "ничего не знает, и такую просьбу ему не повторяй. Агенту нужен ответ хозяина — он спросит сам. Хозяин "
-    "просит отменить или остановить такую просьбу — вызови stop_background с её номером.")
+# Added to the persona while the agent has jobs the owner may come back to (surface.Job): this dialog's or earlier ones'.
+JOBS_NOTE = (
+    "\n\nЗадачи агента (идущие и недавние):\n{jobs}\n"
+    "Реплика хозяина про одну из них (уточнить, добавить, изменить, продолжить, спросить подробности того, что "
+    "агент сделал) — ask_hermes с task=её номер: идущей задаче агент получит это на ходу, законченную продолжит "
+    "со всем, что уже знает. Новая, не связанная просьба — ask_hermes без task (новый запрос ничего не знает об "
+    "этих задачах). «Как там дела?» про идущую задачу — отвечай по этому списку сама. Отменить идущую — "
+    "stop_background с номером. Агенту нужен ответ хозяина — он спросит сам.")
 
 SENT_RE = re.compile(r"(.+?[.!?…]+[\"»)]?)(?:\s+|$)", re.S)
 
@@ -145,9 +150,15 @@ TOOLS = [
             "short filler ('Щас гляну.', 'Займусь.'): do not ask the owner the agent's questions yourself and do "
             "not guess its answer; when the agent needs a choice, a confirmation or a code it asks the owner "
             "itself."),
-        "parameters": {"type": "object", "properties": {"request": {
-            "type": "string",
-            "description": "The full request in Russian, self-contained (resolve 'it', 'there', dates)."}},
+        "parameters": {"type": "object", "properties": {
+            "request": {"type": "string",
+                        "description": "The full request in Russian, self-contained (resolve 'it', 'there', dates)."},
+            "browser": {"type": "boolean",
+                        "description": "true when it needs websites: ordering, booking, an account on a site, looking "
+                                       "something up on a particular site (the agent then thinks it through)."},
+            "task": {"type": "integer",
+                     "description": "Only when this is about one of the agent's tasks listed in the instructions: its "
+                                    "number. Omit for anything new."}},
             "required": ["request"]}}},
     {"type": "function", "function": {
         "name": "end_dialog",
@@ -157,12 +168,20 @@ TOOLS = [
                        "at once; there is no next turn.",
         "parameters": {"type": "object", "properties": {}}}},
 ]
-# Offered only while requests run in the background.
+# Offered only while the agent has running jobs.
 STOP_TOOL = {"type": "function", "function": {
     "name": "stop_background",
-    "description": "Stop a request the agent is doing in the background (numbered in the instructions), when the "
-                   "owner asks to cancel or stop it. The agent's run is interrupted; what it already did stays done.",
+    "description": "Stop a running task of the agent (numbered in the instructions), when the owner asks to cancel or "
+                   "stop it. The agent's run is interrupted; what it already did stays done.",
     "parameters": {"type": "object", "properties": {"number": {"type": "integer"}}, "required": ["number"]}}}
+
+
+def _args(call) -> dict:
+    try:
+        a = json.loads(call.get("args") or "{}")
+    except ValueError:
+        return {}
+    return a if isinstance(a, dict) else {}
 
 
 def tts_body(text: str, voice: str = "") -> dict:
@@ -352,20 +371,18 @@ class Dialog(Session):
         """A background request another dialog started has finished while the owner is in this one."""
         self.notes.append(f"(Агент закончил фоновую просьбу «{request}»: {text or 'готово.'} Расскажи хозяину.)")
 
-    def background_note(self, running) -> str:
-        if not running:
+    def jobs_note(self, jobs) -> str:
+        if not jobs:
             return ""
         now = time.monotonic()
-        return BACKGROUND_NOTE.format(tasks="\n".join(f"{i}. {b.describe(now)}" for i, b in enumerate(running, 1)))
+        return JOBS_NOTE.format(jobs="\n".join(j.describe(now) for j in jobs))
 
     def stop_background(self, args: dict) -> str:
-        running = surface.registry.running()
-        try:
-            b = running[int(args.get("number") or 0) - 1]
-        except (ValueError, TypeError, IndexError):
-            return "Нет фоновой задачи с таким номером." if running else "Фоновых задач нет."
-        surface.registry.stop(b.session)
-        return f"Остановлено: «{b.request[:120]}». Агент прерван; что он успел сделать до этого, отменено не было."
+        job = surface.registry.job(args.get("number"))
+        if job is None or not job.running:
+            return "Нет идущей задачи с таким номером." if surface.registry.running() else "Идущих задач нет."
+        surface.registry.stop(job.session)
+        return f"Остановлено: «{job.request[:120]}». Агент прерван; что он успел сделать до этого, отменено не было."
 
     # ---- reply ----
     # ---- tool calls that survive an interruption ----
@@ -508,12 +525,12 @@ class Dialog(Session):
                 calls = await self.llm_round(q)
                 pre = {}  # call id -> the early request that answers it
                 if early is not None:
-                    asks = [c for c in calls if c["name"] == "ask_hermes"]
+                    asks = [c for c in calls if c["name"] == "ask_hermes" and not _args(c).get("task")]
                     if asks:
-                        # the agent got the whole utterance: further asks of this round are covered by it
+                        # the agent got the whole utterance: further new asks of this round are covered by it
                         pre = {asks[0]["id"]: early, **{c["id"]: COVERED for c in asks[1:]}}
                     else:
-                        log.info("the model did not ask the agent: the early request is dropped")
+                        log.info("the model did not ask the agent anything new: the early request is dropped")
                         early.cancel()
                     early = None
                 if not calls:
@@ -578,6 +595,8 @@ class Dialog(Session):
         if not (AGENT_RACE and stt.has_words(text) and self.group is None and not self.st.hello.get("reminder")
                 and sum(1 for m in self.history if m.get("role") == "user") == 1):
             return None
+        if surface.registry.listed():  # it may be about one of the agent's jobs: the model decides first
+            return None
         log.info("first turn: the agent is asked with the transcript beside the model round")
         return self.spawn(self.ask_agent(text))
 
@@ -589,6 +608,8 @@ class Dialog(Session):
             return ""
         if results[0] == DETACHED_NOTE:
             return DETACHED_SPEECH
+        if results[0] == STEERED_NOTE:
+            return STEERED_SPEECH
         text = clean_for_speech(results[0])
         if not text or len(text) > DIRECT_MAX or text.startswith(("Агент не ответил", "Сделано, ответ пустой")):
             return ""
@@ -689,9 +710,9 @@ class Dialog(Session):
 
     async def llm_round(self, q: asyncio.Queue):
         self.prepare_history()
-        running = surface.registry.running()
-        body = {"model": self.llm, "stream": True, "tools": TOOLS + ([STOP_TOOL] if running else []),
-                "messages": [{"role": "system", "content": self.instructions + self.background_note(running)}]
+        jobs = surface.registry.listed()
+        body = {"model": self.llm, "stream": True, "tools": TOOLS + ([STOP_TOOL] if any(j.running for j in jobs) else []),
+                "messages": [{"role": "system", "content": self.instructions + self.jobs_note(jobs)}]
                 + self.history}  # provider pinning: llm_events
         reasoning = reasoning_for(self.llm)
         if reasoning:
@@ -836,11 +857,16 @@ class Dialog(Session):
             if early is COVERED:
                 return "Сделано вместе с первой просьбой: агент получил всю реплику хозяина целиком."
             request = str(args.get("request", ""))
+            browser = bool(args.get("browser"))
+            if args.get("task"):
+                return await self.continue_job(args.get("task"), request, browser)
             if early is not None:
                 log.info("the model asked the agent: it gets the request already running")
                 task = early
+                if browser:
+                    self.website_task(_session_of.get(task, ""), request, task)
             else:
-                task = asyncio.create_task(self.ask_agent(request))
+                task = asyncio.create_task(self.ask_agent(request, think=browser))
             return await self.wait_or_detach(task, request)
         if c["name"] == "stop_background":
             return self.stop_background(args)
@@ -870,29 +896,61 @@ class Dialog(Session):
 
         def finished(t: asyncio.Task):
             _background.discard(t)
-            if t.cancelled() or self.ending or self.st.closing:
-                return  # the agent side announces it (surface /result)
-            self.notes.append(f"(Агент закончил фоновую просьбу «{request}»: {self.tool_text(t)} Расскажи хозяину.)")
+            if not t.cancelled():  # unless the agent side has told it already (surface /result): a note
+                surface.registry.result(sid, self.tool_text(t), can_announce=False)
         task.add_done_callback(finished)
         return DETACHED_NOTE
 
-    async def ask_agent(self, request: str) -> str:
-        """One agent session per request, named here when the agent allows it: it is bound to this dialog before
-        the agent can ask anything. A request cancelled (dropped, cut short, the dialog gone without it) abandons
-        its session: questions from that run are not put to anyone."""
+    def website_task(self, sid: str, request: str, task: asyncio.Task):
+        """A request that needs websites: its model calls think from the start (the agent side asks GET /session),
+        and it is one of the owner's jobs (they may come back to it)."""
+        if sid:
+            surface.registry.think.add(sid)
+            surface.registry.track(sid, request, task)
+
+    async def continue_job(self, no, request: str, browser: bool) -> str:
+        """The owner's words about one of the agent's jobs: a running one gets them on the way (steer), a finished
+        one goes on in its own session (the agent knows everything it did)."""
+        job = surface.registry.job(no)
+        if job is None:
+            return "Нет задачи с таким номером: если это новая просьба, вызови ask_hermes без task."
+        surface.registry.bind(job.session, self)  # its questions and its answer come to this dialog now
+        if job.running:
+            run_id = surface.registry.runs.get(job.session, "")
+            if run_id and await self.agent.steer(run_id, request):
+                log.info("job №%d steered: %r", job.no, request[:120])
+                return STEERED_NOTE
+            await asyncio.wait({job.task}, timeout=10)  # finishing just now: continue it once it has
+            if job.running:
+                return "Агент сейчас не может принять это в идущую задачу. Скажи хозяину, что передашь, когда он закончит."
+        log.info("job №%d continued in its session %s: %r", job.no, job.session, request[:120])
+        task = asyncio.create_task(self.ask_agent(request, session=job.session,
+                                                  think=browser or job.session in surface.registry.think))
+        surface.registry.track(job.session, request, task)
+        return await self.wait_or_detach(task, request)
+
+    async def ask_agent(self, request: str, session: str = "", think: bool = False) -> str:
+        """One agent session per request, named here when the agent allows it (`session`: continue that one): it is
+        bound to this dialog before the agent can ask anything. A request cancelled (dropped, cut short, the dialog
+        gone without it) abandons its session: questions from that run are not put to anyone."""
         task = asyncio.current_task()
 
         def bound(sid: str):
             _session_of[task] = sid
-            surface.registry.bind(sid, self, request)
+            surface.registry.bind(sid, self, new_run=True)
 
         def step(label: str):
             surface.registry.progress(_session_of.get(task, ""), label)
-        sid = f"live-{secrets.token_hex(8)}" if self.agent.names_sessions() else ""
+
+        def run(run_id: str):
+            surface.registry.runs[_session_of.get(task, "")] = run_id
+        sid = session or (f"live-{secrets.token_hex(8)}" if self.agent.names_sessions() else "")
         if sid:
             bound(sid)
+            if think:
+                self.website_task(sid, request, task)
         try:
-            return await self.agent.ask(request, on_session=bound, session=sid, on_progress=step)
+            return await self.agent.ask(request, on_session=bound, session=sid, on_progress=step, on_run=run)
         except asyncio.CancelledError:
             surface.registry.abandon(_session_of.get(task, ""), self)
             raise

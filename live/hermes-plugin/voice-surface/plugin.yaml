@@ -7,7 +7,8 @@ description: >-
   the speakers and returns only the parsed answer (a code is typed into the page by Hermes and never reaches the
   model). Also: the ask_owner tool, the Bitwarden session from hermes-bw-unlock (RAM only), Bitwarden cards and
   identities as payment / address vault items, announcing answers of requests whose Live dialog has ended, and
-  (llm_request middleware) the router's thinking model for requests that went on in the background.
+  (llm_request middleware) the router's thinking model for website tasks and requests that went on in the
+  background, the fast one for the mechanical step after a browser action.
 author: local
 config_schema:
   bridge_url:

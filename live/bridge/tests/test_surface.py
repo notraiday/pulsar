@@ -81,8 +81,57 @@ def fakes(seen, transcripts, hermes_delay=0.0, release=None, reply=None, model=N
         await resp.write_eof()
         return resp
 
+    runs = {}
+
+    def sse(ev):
+        return ("data: " + json.dumps(ev, ensure_ascii=False) + "\n\n").encode()
+
+    async def run_start(req):
+        body = await req.json()
+        seen["hermes"].append(body["input"])
+        seen.setdefault("sessions", []).append(body.get("session_id"))
+        rid = f"run_{len(runs) + 1}"
+        runs[rid] = {"steers": [], "stop": asyncio.Event()}
+        return web.json_response({"run_id": rid, "status": "started"}, status=202)
+
+    async def run_events(req):
+        run = runs[req.match_info["id"]]
+        resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await resp.prepare(req)
+        await resp.write(sse({"event": "tool.started", "tool": "browser_navigate", "preview": "открываю сайт", "seq": 0}))
+        waits = [asyncio.ensure_future(run["stop"].wait())]
+        if release is not None:
+            waits.append(asyncio.ensure_future(release.wait()))
+        else:
+            waits.append(asyncio.ensure_future(asyncio.sleep(hermes_delay)))
+        await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+        for w in waits:
+            w.cancel()
+        if run["stop"].is_set():
+            await resp.write(sse({"event": "run.cancelled", "seq": 1}))
+        else:
+            out = "Готово, заказ оформлен." + (" Учла: " + "; ".join(run["steers"]) + "." if run["steers"] else "")
+            await resp.write(sse({"event": "run.completed", "output": out, "seq": 1}))
+        await resp.write_eof()
+        return resp
+
+    async def run_steer(req):
+        text = (await req.json())["input"]
+        runs[req.match_info["id"]]["steers"].append(text)
+        seen.setdefault("steers", []).append(text)
+        return web.json_response({"accepted": True})
+
+    async def run_stop(req):
+        runs[req.match_info["id"]]["stop"].set()
+        seen.setdefault("stops", []).append(req.match_info["id"])
+        return web.json_response({"object": "hermes.run.stop"})
+
     app = web.Application()
     app.router.add_post("/chat/completions", chat)
+    app.router.add_post("/hermes/v1/runs", run_start)
+    app.router.add_get("/hermes/v1/runs/{id}/events", run_events)
+    app.router.add_post("/hermes/v1/runs/{id}/steer", run_steer)
+    app.router.add_post("/hermes/v1/runs/{id}/stop", run_stop)
     app.router.add_post("/audio/speech", speech)
     app.router.add_get("/key", lambda req: web.json_response({}))
     app.router.add_post("/stt/audio/transcriptions", transcriptions)
@@ -203,11 +252,126 @@ def test_a_long_request_goes_on_in_the_background_and_is_told_later(tmp_path, mo
             await s_runner.cleanup()
             return alive, gone, unauthorized, unknown, got
     alive, gone, unauthorized, unknown, got = asyncio.run(go())
-    assert seen["tts"] == [pipeline.DETACHED_SPEECH, "Заказ оформлен."]
-    assert alive == {"announce": False} and gone == {"announce": True} and unauthorized == 401
+    assert seen["tts"] == [pipeline.DETACHED_SPEECH, "Заказ оформлен."]   # told once: not again when it returns
+    assert alive == {"announce": False} and gone == {"announce": False} and unauthorized == 401
     assert unknown == {"announce": False}          # a session no Live dialog started (HA's own pipeline)
     assert len(seen["hermes"]) == 1                # one request: the early one, detached
     assert got[-1] == (b"X", b"idle")
+
+
+def test_a_background_request_with_no_dialog_left_is_announced_once(tmp_path, monkeypatch, fake_vad):
+    seen = {"chat": [], "tts": [], "stt": 0, "hermes": []}
+
+    async def go():
+        release = asyncio.Event()
+        runner, port = await serve_app(fakes(seen, ["Закажи пиццу."], release=release))
+        s_runner, s_port = await serve_app(surface.app())
+        setup(monkeypatch, port)
+        monkeypatch.setattr(agent, "HERMES_KEY", "hk")
+        monkeypatch.setattr(pipeline, "DETACH_S", 0.3)
+        routes = tmp_path / "routes.json"
+        routes.write_text(json.dumps({"default": "pipeline"}))
+        base = f"http://127.0.0.1:{s_port}"
+        async with aiohttp.ClientSession() as http:
+            server = await bridge.serve("127.0.0.1:0", Routes(routes), http)
+            sid = await background_request(http, server, seen)
+            async with http.post(f"{base}/result", json={"session": sid, "text": "Готово."}, headers=AUTH) as resp:
+                first = await resp.json()
+            async with http.post(f"{base}/result", json={"session": sid, "text": "Готово."}, headers=AUTH) as resp:
+                again = await resp.json()
+            release.set()
+            await until(lambda: not surface.registry.running())
+            server.close()
+            await runner.cleanup()
+            await s_runner.cleanup()
+            return first, again
+    first, again = asyncio.run(go())
+    assert first == {"announce": True} and again == {"announce": False}
+
+
+def test_the_owner_steers_a_running_website_task_from_another_dialog(tmp_path, monkeypatch, fake_vad):
+    seen = {"chat": [], "tts": [], "stt": 0, "hermes": []}
+
+    def model(body):
+        system = body["messages"][0]["content"]
+        if body["messages"][-1].get("role") != "user" or "Агент закончил" in str(body["messages"][-1]["content"]):
+            return None
+        args = ({"request": "Пиццу пепперони вместо маргариты.", "task": 1} if "Задачи агента" in system
+                else {"request": "Закажи пиццу маргарита на сайте.", "browser": True})
+        return {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "function": {
+            "name": "ask_hermes", "arguments": json.dumps(args, ensure_ascii=False)}}]}}]}
+
+    async def go():
+        release = asyncio.Event()
+        runner, port = await serve_app(fakes(seen, ["Закажи пиццу.", "Лучше пепперони."], release=release, model=model))
+        s_runner, s_port = await serve_app(surface.app())
+        setup(monkeypatch, port)
+        monkeypatch.setattr(agent, "HERMES_KEY", "hk")
+        monkeypatch.setattr(pipeline, "DETACH_S", 0.3)
+        routes = tmp_path / "routes.json"
+        routes.write_text(json.dumps({"default": "pipeline"}))
+        base = f"http://127.0.0.1:{s_port}"
+        async with aiohttp.ClientSession() as http:
+            server = await bridge.serve("127.0.0.1:0", Routes(routes), http)
+            sid = await background_request(http, server, seen)
+            async with http.get(f"{base}/session/{sid}", headers=AUTH) as resp:
+                flags = await resp.json()
+            r, w = await station(server.sockets[0].getsockname()[1])
+            speak(w)
+            await frames_until(r, {b"A"})          # "passed it on"
+            w.write(wire.frame(b"D"))
+            release.set()                          # the run ends with the change in it
+            await frames_until(r, {b"A"})          # its result, in this dialog
+            w.write(wire.frame(b"D"))
+            got = await frames_until(r, {b"X"})
+            server.close()
+            await runner.cleanup()
+            await s_runner.cleanup()
+            return sid, flags, got
+    sid, flags, got = asyncio.run(go())
+    assert flags == {"background": True, "think": True}
+    assert seen["steers"] == ["Пиццу пепперони вместо маргариты."]
+    assert len(seen["hermes"]) == 1                # no second run: the dialog decided, no early request
+    assert seen["tts"][:3] == [pipeline.DETACHED_SPEECH, pipeline.STEERED_SPEECH, "Заказ оформлен."]
+    note = seen["chat"][-1]["messages"][-1]["content"]
+    assert "Учла: Пиццу пепперони вместо маргариты." in note
+    assert got[-1] == (b"X", b"idle")
+
+
+def test_a_finished_task_is_continued_in_its_own_session(tmp_path, monkeypatch, fake_vad):
+    seen = {"chat": [], "tts": [], "stt": 0, "hermes": []}
+
+    def model(body):
+        system = body["messages"][0]["content"]
+        if body["messages"][-1].get("role") != "user":
+            return None
+        args = ({"request": "Когда привезут заказанную пиццу?", "task": 1} if "закончена" in system
+                else {"request": "Закажи пиццу на сайте.", "browser": True})
+        return {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "function": {
+            "name": "ask_hermes", "arguments": json.dumps(args, ensure_ascii=False)}}]}}]}
+
+    async def go():
+        runner, port = await serve_app(fakes(seen, ["Закажи пиццу.", "А когда привезут?"], model=model))
+        s_runner, s_port = await serve_app(surface.app())
+        setup(monkeypatch, port)
+        monkeypatch.setattr(agent, "HERMES_KEY", "hk")
+        monkeypatch.setattr(pipeline, "AGENT_RACE", False)
+        routes = tmp_path / "routes.json"
+        routes.write_text(json.dumps({"default": "pipeline"}))
+        async with aiohttp.ClientSession() as http:
+            server = await bridge.serve("127.0.0.1:0", Routes(routes), http)
+            for _ in range(2):                     # two dialogs, one request each
+                r, w = await station(server.sockets[0].getsockname()[1])
+                speak(w)
+                await frames_until(r, {b"A"})
+                w.write(wire.frame(b"D"))
+                await frames_until(r, {b"X"})
+            server.close()
+            await runner.cleanup()
+            await s_runner.cleanup()
+    asyncio.run(go())
+    assert seen["hermes"] == ["@@LIVE@@ Закажи пиццу на сайте.", "@@LIVE@@ Когда привезут заказанную пиццу?"]
+    assert len(set(seen["sessions"])) == 1         # the second went on in the first one's session
 
 
 def test_a_dropped_request_asks_nobody_and_is_not_announced(tmp_path, monkeypatch, fake_vad):
@@ -306,7 +470,7 @@ def test_a_background_request_asks_and_answers_in_the_dialog_in_progress(tmp_pat
             await s_runner.cleanup()
             return bg, ask, answer, result, got
     bg, ask, answer, result, got = asyncio.run(go())
-    assert bg == {"background": True}
+    assert bg == {"background": True, "think": False}
     assert ask["wake"] is False and answer == {"status": "answered", "answer": "Синий."}
     assert result == {"announce": False}
     assert seen["tts"][:4] == [pipeline.DETACHED_SPEECH, surface.FOREIGN_LEAD + "Какой цвет коробки?",
@@ -353,7 +517,7 @@ def test_the_owner_hears_of_and_can_stop_a_background_request(tmp_path, monkeypa
     sid, running, got = asyncio.run(go())
     assert running == [sid]
     stop_round = seen["chat"][-2]
-    assert "1. «сделай», идёт" in stop_round["messages"][0]["content"]
+    assert "№1. «сделай» — идёт" in stop_round["messages"][0]["content"]
     assert "stop_background" in [t["function"]["name"] for t in stop_round["tools"]]
     assert seen["chat"][-1]["messages"][-1]["content"].startswith("Остановлено: «сделай»")
     assert surface.registry.running() == [] and sid in surface.registry.abandoned

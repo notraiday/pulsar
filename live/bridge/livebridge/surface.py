@@ -18,12 +18,14 @@ The agent side (a Hermes plugin) talks to it over HTTP (LIVE_SURFACE_LISTEN, bea
                 The agent is about to answer. The dialog that asked speaks it while it lasts; once it has ended, a
                 Live dialog in progress gets it (spoken there); with none, true: the caller announces it.
                 Sessions the bridge never saw (Home Assistant's own pipeline) are never announced.
-  GET  /session/ID                   -> {"background": bool}
-                The request went on in the background: nobody waits for it, the agent may think longer.
+  GET  /session/ID                   -> {"background": bool, "think": bool}
+                The request went on in the background (nobody waits for it), or is a website task: the agent
+                may think longer.
 
 Agent sessions are bound to dialogs by their X-Hermes-Session-Id: the dialog names each request's session (agent.py).
-Requests running in the background are listed for every dialog (what was asked, the agent's last step), so the
-owner can ask how one is going or stop it.
+Requests running in the background and website tasks are jobs, listed for every dialog for a while (what was asked,
+the agent's last step or its answer): the owner can ask how one is going, add to it or change it (the dialog steers
+the running request, or continues the job's session), or stop it.
 """
 import asyncio
 import hmac
@@ -82,18 +84,49 @@ class Ask:
         return ("answered", t) if t else ("unclear", "")
 
 
-class Background:
-    """An agent request that went on after its dialog stopped waiting for it."""
+class Job:
+    """An agent request the owner may come back to: one that went on in the background, or a website task. Numbered
+    for the dialog model (ask_hermes task=N continues or steers it, stop_background stops it)."""
 
-    def __init__(self, session: str, request: str, task: asyncio.Task):
-        self.session, self.request, self.task = session, request, task
+    def __init__(self, no: int, session: str, request: str):
+        self.no, self.session, self.request = no, session, request
+        self.task: asyncio.Task | None = None
         self.started = time.monotonic()
         self.step, self.step_at = "", 0.0
+        self.done_at: float | None = None
+        self.result = ""
+        self.told = False          # its answer reached the owner (a dialog's note, or an announcement)
+
+    @property
+    def running(self) -> bool:
+        return self.task is not None and not self.task.done()
+
+    def attach(self, task: asyncio.Task):
+        """A run of this job's session (the first one, or one continuing it)."""
+        if task is self.task:
+            return
+        self.task, self.started, self.done_at, self.told = task, time.monotonic(), None, False
+        task.add_done_callback(self._finished)
+
+    def _finished(self, t: asyncio.Task):
+        if t is not self.task:
+            return
+        self.done_at = time.monotonic()
+        if t.cancelled():
+            self.result = "остановлена."
+        elif t.exception() is not None:
+            self.result = f"не удалась: {t.exception()}"[:200]
+        else:
+            self.result = str(t.result())[:300]
 
     def describe(self, now: float) -> str:
-        out = f"«{self.request[:200]}», идёт {_ago(now - self.started)}"
-        if self.step:
-            out += f"; последний шаг агента {_ago(now - self.step_at)} назад: {self.step}"
+        out = f"№{self.no}. «{self.request[:200]}» — "
+        if self.running:
+            out += f"идёт {_ago(now - self.started)}"
+            if self.step:
+                out += f"; последний шаг агента {_ago(now - self.step_at)} назад: {self.step}"
+        else:
+            out += f"закончена {_ago(now - (self.done_at or now))} назад: {self.result}"
         return out
 
 
@@ -106,14 +139,18 @@ def _live(d) -> bool:
 
 
 class Registry:
+    RECENT_S = 1800.0   # a finished job stays on the list this long (the owner may continue it)
+    LISTED = 6
+
     def __init__(self):
         self.dialogs: "weakref.WeakValueDictionary[str, object]" = weakref.WeakValueDictionary()  # session -> dialog
         self.open: "weakref.WeakSet" = weakref.WeakSet()  # Live dialogs in progress
-        self.detached: set[str] = set()
-        self.background: dict[str, Background] = {}       # detached requests still running
-        self.requests: dict[str, str] = {}                 # session -> what it was asked
+        self.detached: set[str] = set()   # sessions whose current request went on in the background
+        self.think: set[str] = set()      # sessions whose model calls think from the start (website tasks)
+        self.runs: dict[str, str] = {}    # session -> its current run (agent.Agent.steer)
+        self.jobs: dict[str, Job] = {}    # session -> job
+        self._jobs_made = 0
         self.known: set[str] = set()      # sessions a dialog started: only theirs are ever announced
-        self.announced: set[str] = set()
         self.abandoned: set[str] = set()  # requests nobody waits for: their questions are not put to anyone
         self.asks: dict[str, Ask] = {}
 
@@ -129,17 +166,18 @@ class Registry:
         live = [d for d in self.open if d is not but and _live(d)]
         return max(live, key=lambda d: d.last_activity, default=None)
 
-    def bind(self, session: str, dialog, request: str = ""):
+    def bind(self, session: str, dialog, new_run: bool = False):
+        """`dialog` is the one this session's questions and answer go to. `new_run`: a request of it starts now (the
+        dialog waits for it; not in the background)."""
         if session:
             self.dialogs[session] = dialog
             self.known.add(session)
-            self.announced.discard(session)
             self.abandoned.discard(session)
-            if request:
-                self.requests[session] = request
+            if new_run:
+                self.detached.discard(session)
 
     def abandon(self, session: str, dialog=None):
-        """Nobody waits for this session's request any more (closing it interrupts the agent). With `dialog`: only
+        """Nobody waits for this session's request any more (closing it stops the agent's run). With `dialog`: only
         while the session is still that dialog's."""
         if not session or (dialog is not None and self.dialogs.get(session) is not dialog):
             return
@@ -150,37 +188,56 @@ class Registry:
                 a.resolve("no_answer")
         log.info("session %s abandoned: its request was dropped", session)
 
+    def track(self, session: str, request: str, task: asyncio.Task) -> Job | None:
+        """Keep this request on the owner's list of jobs (a continued session keeps its number and first words)."""
+        if not session:
+            return None
+        job = self.jobs.get(session)
+        if job is None:
+            self._jobs_made += 1
+            job = self.jobs[session] = Job(self._jobs_made, session, request)
+        job.attach(task)
+        return job
+
     def detach(self, session: str, task: asyncio.Task | None = None, request: str = ""):
         if not session:
             return
         self.detached.add(session)
-        if request:  # the model's words for it (self-contained), not the transcript an early request started with
-            self.requests[session] = request
         if task is not None and not task.done():
-            self.background[session] = Background(session, self.requests.get(session, ""), task)
-            task.add_done_callback(lambda _t, s=session: self.background.pop(s, None))
+            self.track(session, request, task)
 
     def progress(self, session: str, step: str):
-        b = self.background.get(session)
-        if b is not None and step:
-            b.step, b.step_at = step[:120], time.monotonic()
+        job = self.jobs.get(session)
+        if job is not None and step:
+            job.step, job.step_at = step[:120], time.monotonic()
 
-    def running(self) -> list[Background]:
-        return sorted((b for b in self.background.values() if not b.task.done()), key=lambda b: b.started)
+    def listed(self) -> list[Job]:
+        """The jobs a dialog model is told about: running ones, and ones finished in the last RECENT_S."""
+        now = time.monotonic()
+        for s in [s for s, j in self.jobs.items() if not j.running and j.done_at and now - j.done_at > self.RECENT_S]:
+            del self.jobs[s]
+        jobs = [j for j in self.jobs.values() if j.running or j.done_at is not None]
+        return sorted(jobs, key=lambda j: j.no)[-self.LISTED:]
+
+    def running(self) -> list[Job]:
+        return [j for j in self.listed() if j.running]
+
+    def job(self, no) -> Job | None:
+        try:
+            no = int(no)
+        except (TypeError, ValueError):
+            return None
+        return next((j for j in self.listed() if j.no == no), None)
 
     def stop(self, session: str) -> bool:
-        """The owner stopped a background request: closing it interrupts the agent's run."""
-        b = self.background.pop(session, None)
-        if b is None or b.task.done():
+        """The owner stopped a job: cancelling its request stops the agent's run."""
+        job = self.jobs.get(session)
+        if job is None or not job.running:
             return False
         self.abandon(session)
-        b.task.cancel()
-        log.info("background request of %s stopped by the owner", session)
+        job.task.cancel()
+        log.info("job №%d (%s) stopped by the owner", job.no, session)
         return True
-
-    def listening(self, session: str) -> bool:
-        """Will the dialog that asked speak this session's answer itself?"""
-        return _live(self.dialogs.get(session))
 
     # ---- questions ----
     def ask(self, session: str, kind: str, text: str, timeout: float) -> Ask:
@@ -216,18 +273,28 @@ class Registry:
         return None
 
     # ---- answers ----
-    def result(self, session: str, text: str) -> str:
-        """Who tells the owner this session's answer: "dialog" (the one that asked), "current" (handed to the Live
-        dialog in progress), "announce" (nobody: the caller announces it) or "none" (not ours to tell)."""
-        if session not in self.known or session in self.abandoned or session in self.announced:
+    def result(self, session: str, text: str, can_announce: bool = True) -> str:
+        """Who tells the owner this session's answer: "dialog" (the dialog waiting for the request: its reply),
+        "note" (the session's dialog, or the Live dialog in progress, gets it as a note), "announce" (no dialog: the
+        caller announces it) or "none" (not ours to tell, or told already). Called by the agent side before its
+        answer goes out (/result), and by the bridge when the request returns (`can_announce` False): whichever
+        comes first tells it."""
+        if session not in self.known or session in self.abandoned:
             return "none"
-        if self.listening(session):
-            return "dialog"
-        self.announced.add(session)
-        d = self.current()
+        if session not in self.detached:
+            return "dialog" if _live(self.dialogs.get(session)) else "none"
+        job = self.jobs.get(session)
+        if job is not None and job.told:
+            return "none"
+        own = self.dialogs.get(session)
+        d = own if _live(own) else self.current()
+        if d is None and not can_announce:
+            return "none"
+        if job is not None:
+            job.told = True
         if d is not None:
-            d.background_result(self.requests.get(session, ""), text)
-            return "current"
+            d.background_result(job.request if job else "", text)
+            return "note"
         return "announce"
 
     def prune(self):
@@ -280,8 +347,8 @@ async def _get_ask(request: web.Request):
     return web.json_response(a.future.result() if a.future.done() else {"status": "pending", "answer": ""})
 
 
-_RESULT_LOG = {"dialog": "the dialog speaks it", "current": "told in the Live dialog in progress",
-               "announce": "announce it", "none": "not ours to tell"}
+_RESULT_LOG = {"dialog": "the dialog speaks it", "note": "told in a Live dialog", "announce": "announce it",
+               "none": "not ours to tell (or told already)"}
 
 
 async def _post_result(request: web.Request):
@@ -295,7 +362,8 @@ async def _post_result(request: web.Request):
 
 
 async def _get_session(request: web.Request):
-    return web.json_response({"background": request.match_info["id"] in registry.detached})
+    sid = request.match_info["id"]
+    return web.json_response({"background": sid in registry.detached, "think": sid in registry.think})
 
 
 def app() -> web.Application:
